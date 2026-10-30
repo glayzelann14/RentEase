@@ -53,6 +53,7 @@ function removeLegacyAuthentication() {
   }
 }
 
+
 async function request(
   path: string,
   body?: Record<string, unknown>,
@@ -67,6 +68,7 @@ async function request(
         ? { 'Content-Type': 'application/json' }
         : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      cache: 'no-store',
     });
   } catch {
     throw new Error(
@@ -78,11 +80,13 @@ async function request(
 
   if (!response.ok || !data?.success) {
     throw new Error(
-      data?.message || 'The request could not be completed.',
+      typeof data?.message === 'string'
+        ? data.message
+        : 'The request could not be completed.',
     );
   }
 
-  return data;
+  return data as AuthResponse;
 }
 
 export async function login(

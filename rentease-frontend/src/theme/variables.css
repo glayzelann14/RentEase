@@ -115,3 +115,44 @@ ion-alert.rentease-messagebox .alert-button {
 ion-alert.rentease-messagebox .alert-button-role-cancel {
   color: #52637a;
 }
+
+/* RentEase: keep Ionic modal backgrounds consistent with the light theme */
+ion-modal {
+  --background: #ffffff;
+  --ion-background-color: #ffffff;
+  --ion-text-color: #183153;
+  --border-radius: 16px;
+  color-scheme: light;
+}
+
+ion-modal::part(content) {
+  background: #ffffff !important;
+  color: #183153 !important;
+}
+
+ion-modal .modal-content {
+  background: #ffffff !important;
+  color: #183153 !important;
+}
+
+ion-modal .modal-heading h2 {
+  color: #183153 !important;
+}
+
+ion-modal .modal-heading p {
+  color: #8190a3 !important;
+}
+
+ion-modal .details-row strong {
+  color: #536780 !important;
+}
+
+ion-modal .details-row span {
+  color: #273e5b !important;
+}
+
+ion-modal input,
+ion-modal select {
+  background: #ffffff !important;
+  color: #273e5b !important;
+}

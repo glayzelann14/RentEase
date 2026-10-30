@@ -3,18 +3,11 @@ import { computed, reactive, ref, watch, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { logout as logoutUser } from '@/services/auth';
 import { restoreSession } from '@/services/auth';
-onMounted(async () => {
-  try {
-    const user = await restoreSession();
-
-    if (user) {
-      state.profile.name = user.name;
-      state.profile.email = user.email;
-    }
-  } catch (error) {
-    console.error('Failed to restore user session:', error);
-  }
-});
+import { listProperties, listPropertyUnits, createProperty, createUnit, updateProperty, updateUnit } from '@/services/properties';
+import { listOwnerApplications, reviewRentalApplication, type RentalApplication } from '@/services/applications';
+import { listOwnerLeases, prepareLease, finishLease, type RentalLease } from '@/services/leases';
+import { listOwnerBills, listOwnerPayments, createBill, decidePayment, type RentalBill, type RentalPayment } from '@/services/billing';
+import { listOwnerMaintenance, updateMaintenanceStatus, type RentalMaintenanceRequest } from '@/services/maintenance';
 import {
   IonPage,
   IonHeader,
@@ -37,7 +30,12 @@ import {
   personOutline,
   closeOutline,
   notificationsOutline,
+  checkmarkCircleOutline,
   logOutOutline,
+  menuOutline,
+  chevronForwardOutline,
+  addOutline,
+  refreshOutline,
 } from 'ionicons/icons';
 type Property = {
   id: number;
@@ -51,6 +49,7 @@ type Unit = {
   rent: number;
   bedrooms: number;
   capacity: number;
+  status?: string;
 };
 type Application = {
   id: number;
@@ -71,7 +70,9 @@ type Lease = {
   start: string;
   end: string;
   rent: number;
-  status: 'ACTIVE' | 'COMPLETED';
+  status: 'PENDING' | 'ACTIVE' | 'COMPLETED';
+  deposit?: number;
+  applicationId?: number | null;
 };
 type Bill = {
   id: number;
@@ -79,7 +80,10 @@ type Bill = {
   period: string;
   due: string;
   amount: number;
+  verified: number;
+  status: string;
 };
+
 type Payment = {
   id: number;
   billId: number;
@@ -98,6 +102,8 @@ type Maintenance = {
   description: string;
   date: string;
   status: string;
+  priority?: string;
+  tenant?: string;
 };
 type Activity = {
   id: number;
@@ -122,6 +128,22 @@ type DemoState = {
 };
 const router = useRouter();
 const STORAGE_KEY = 'rentease-owner-demo-v3';
+const propertiesLoading = ref(false);
+const savingRental = ref(false);
+const rentalLoaded = ref(false);
+const unitSaveStatus = ref('');
+const applicationsLoading = ref(false);
+const applicationsError = ref('');
+const reviewingApplication = ref(false);
+const leasesLoading = ref(false);
+const leasesError = ref('');
+const savingLease = ref(false);
+const financeLoading=ref(false);
+const financeSaving=ref(false);
+const financeError=ref('');
+const maintenanceLoading=ref(false);
+const maintenanceSaving=ref(false);
+const maintenanceError=ref('');
 function dateOffset(days: number): string {
   const date = new Date();
   date.setDate(date.getDate() + days);
@@ -243,27 +265,27 @@ function seed(): DemoState {
     bills: [
       {
         id: 1, leaseId: 1, period: monthOffset(0),
-        due: dateOffset(-5), amount: 9700,
+        due: dateOffset(-5), amount: 9700, verified: 0, status: 'UNPAID',
       },
       {
         id: 2, leaseId: 2, period: monthOffset(0),
-        due: dateOffset(3), amount: 8500,
+        due: dateOffset(3), amount: 8500, verified: 0, status: 'UNPAID',
       },
       {
         id: 3, leaseId: 3, period: monthOffset(0),
-        due: dateOffset(-2), amount: 9000,
+        due: dateOffset(-2), amount: 9000, verified: 0, status: 'UNPAID',
       },
       {
         id: 4, leaseId: 1, period: monthOffset(-1),
-        due: `${monthOffset(-1)}-05`, amount: 8000,
+        due: `${monthOffset(-1)}-05`, amount: 8000, verified: 0, status: 'UNPAID',
       },
       {
         id: 5, leaseId: 2, period: monthOffset(-2),
-        due: `${monthOffset(-2)}-05`, amount: 8500,
+        due: `${monthOffset(-2)}-05`, amount: 8500, verified: 0, status: 'UNPAID',
       },
       {
         id: 6, leaseId: 3, period: monthOffset(-3),
-        due: `${monthOffset(-3)}-05`, amount: 9000,
+        due: `${monthOffset(-3)}-05`, amount: 9000, verified: 0, status: 'UNPAID',
       },
     ],
     payments: [
@@ -353,15 +375,230 @@ try {
   storageWarning = 'Browser storage is unavailable. Changes may not survive a refresh.';
 }
 const state = reactive<DemoState>(initialState);
+// The rental catalog uses PostgreSQL. Older localStorage IDs are never trusted.
+state.properties = [];
+state.units = [];
+// Other modules are not integrated yet; do not display sample financial/tenant data as real.
+state.applications = [];
+state.leases = [];
+state.bills = [];
+state.payments = [];
+state.maintenance = [];
+state.activity = [];
 const message = ref(storageWarning);
 watch(state, () => {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ ...state, properties: [], units: [], applications: [], leases: [], bills: [], payments: [], maintenance: [], activity: [] }));
   } catch {
     message.value = 'Changes are in memory, but browser storage could not save them.';
   }
 }, { deep: true });
+async function refreshRentalCatalog() {
+  propertiesLoading.value = true;
+  try {
+    const properties = await listProperties();
+    const unitsByProperty = await Promise.all(
+      properties.map(property => listPropertyUnits(property.property_id))
+    );
+    state.properties = properties.map(property => ({
+      id: Number(property.property_id),
+      name: property.property_name,
+      address: property.address,
+    }));
+    state.units = unitsByProperty.flat().map(unit => ({
+      id: Number(unit.unit_id),
+      propertyId: Number(unit.property_id),
+      number: unit.unit_number,
+      rent: Number(unit.monthly_rent),
+      bedrooms: Number(unit.bedrooms ?? 0),
+      capacity: Number(unit.capacity ?? 1),
+      status: String(unit.status ?? 'available').toUpperCase(),
+    }));
+    rentalLoaded.value = true;
+  } catch (error) {
+    console.error('Failed to load rental catalog:', error);
+    message.value = 'Could not load properties and units from the server. Please refresh.';
+  } finally {
+    propertiesLoading.value = false;
+  }
+}
+
+// PostgreSQL application records are the only source for owner applications.
+// PostgreSQL may serialize DATE columns as ISO timestamps; normalize for the UI.
+function sqlDate(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.slice(0, 10) : '';
+}
+function mapOwnerApplication(row: RentalApplication): Application {
+  return {
+    id: Number(row.application_id),
+    unitId: Number(row.unit_id),
+    name: row.tenant_name || 'Tenant',
+    email: row.tenant_email || '',
+    phone: row.contact_details || '',
+    moveIn: sqlDate(row.move_in_date),
+    duration: Number(row.lease_duration_months),
+    submitted: sqlDate((row as RentalApplication & { submitted_at?: string; created_at?: string }).submitted_at || (row as RentalApplication & { created_at?: string }).created_at) || '',
+    status: String(row.status).toUpperCase() as Application['status'],
+    decided: sqlDate(row.reviewed_at),
+  };
+}
+async function refreshOwnerApplications(): Promise<boolean> {
+  if (applicationsLoading.value) return false;
+  applicationsLoading.value = true;
+  applicationsError.value = '';
+  try {
+    const records = await listOwnerApplications();
+    state.applications = records.map(mapOwnerApplication);
+    return true;
+  } catch (error) {
+    console.error('[RentEase] Owner application loading failed:', error);
+    applicationsError.value = error instanceof Error ? error.message : 'Could not load applications.';
+    return false;
+  } finally {
+    applicationsLoading.value = false;
+  }
+}
+
+function convertLease(row: RentalLease): Lease {
+  return { id: Number(row.lease_id), unitId: Number(row.unit_id), tenant: row.tenant_name || 'Tenant',
+    start: String(row.start_date).slice(0,10), end: String(row.end_date).slice(0,10),
+    rent: Number(row.monthly_rent), status: String(row.status).toUpperCase() as Lease['status'],
+    deposit: Number(row.security_deposit || 0), applicationId: row.application_id == null ? null : Number(row.application_id) };
+}
+async function refreshOwnerLeases() {
+  if (leasesLoading.value) return;
+  leasesLoading.value = true; leasesError.value = '';
+  try { state.leases = (await listOwnerLeases()).map(convertLease); }
+  catch (error: any) { leasesError.value = error?.response?.data?.message || error?.message || 'Unable to load leases.'; }
+  finally { leasesLoading.value = false; }
+}
+const leaseDialogOpen = ref(false);
+const leaseDialogApplication = ref<Application | null>(null);
+const leaseDeposit = ref('0');
+const leaseDialogError = ref('');
+function openLeasePreparation(app: Application) {
+  if (savingLease.value || app.status !== 'APPROVED') return;
+  if (state.leases.some(l => l.applicationId === app.id && l.status !== 'COMPLETED')) {
+    notify('A lease agreement already exists for this application.'); return;
+  }
+  leaseDialogApplication.value = app;
+  leaseDeposit.value = '0';
+  leaseDialogError.value = '';
+  leaseDialogOpen.value = true;
+}
+function closeLeasePreparation() {
+  if (savingLease.value) return;
+  leaseDialogOpen.value = false;
+  leaseDialogApplication.value = null;
+  leaseDialogError.value = '';
+}
+async function submitLeasePreparation() {
+  const app = leaseDialogApplication.value;
+  if (!app || savingLease.value) return;
+  const amount = Number(leaseDeposit.value);
+  if (!leaseDeposit.value.trim() || !Number.isFinite(amount) || amount < 0) {
+    leaseDialogError.value = 'Enter a valid security deposit of ₱0 or more.'; return;
+  }
+  savingLease.value = true;
+  leaseDialogError.value = '';
+  try {
+    await prepareLease(app.id, amount);
+    await refreshOwnerLeases();
+    leaseDialogOpen.value = false;
+    leaseDialogApplication.value = null;
+    closeDialog();
+    navigate('leases');
+    notify('Lease agreement prepared. The tenant can now review and confirm the rental terms.');
+  } catch (error: any) {
+    leaseDialogError.value = error?.response?.data?.message || error?.message || 'Unable to prepare the lease. Please try again.';
+  } finally { savingLease.value = false; }
+}
+async function createLeaseFromApplication(app: Application) { openLeasePreparation(app); }
+function ownerBill(row:RentalBill):Bill {return {id:Number(row.bill_id),leaseId:Number(row.lease_id),period:String(row.billing_period).slice(0,7),due:String(row.due_date).slice(0,10),amount:Number(row.total_amount),verified:Number(row.verified_amount),status:String(row.status).toUpperCase()};}
+function ownerPayment(row:RentalPayment):Payment{return {id:Number(row.payment_id),billId:Number(row.bill_id),amount:Number(row.amount),method:row.payment_method,reference:row.reference_number||'',date:String(row.payment_date).slice(0,10),status:(row.status==='pending_verification'?'PENDING':String(row.status).toUpperCase()) as Payment['status'],proof:'',note:''};}
+async function refreshFinances(){if(financeLoading.value)return;financeLoading.value=true;financeError.value='';try{const [b,p]=await Promise.all([listOwnerBills(),listOwnerPayments()]);state.bills=b.map(ownerBill);state.payments=p.map(ownerPayment);}catch(e:any){financeError.value=e?.response?.data?.message||e?.message||'Failed to load billing records.';notify(financeError.value);}finally{financeLoading.value=false;}}
+const billingModalOpen = ref(false);
+const billingStep = ref<1 | 2>(1);
+const billingError = ref('');
+const billingForm = reactive({ leaseId: 0, month: '', due: '', water: '0', electricity: '0', other: '0' });
+const eligibleBillingLeases = computed(() => state.leases.filter(lease => lease.status === 'ACTIVE'));
+const chosenBillingLease = computed(() => eligibleBillingLeases.value.find(lease => lease.id === billingForm.leaseId));
+const extraBillCharges = computed(() => ['water','electricity','other'].reduce((sum, key) => sum + (Number(billingForm[key as 'water'|'electricity'|'other']) || 0), 0));
+const estimatedBillTotal = computed(() => Number(chosenBillingLease.value?.rent || 0) + extraBillCharges.value);
+function closeBillingModal() { if (!financeSaving.value) { billingModalOpen.value = false; billingError.value = ''; } }
+function issueBill() {
+  if (financeSaving.value) return;
+  const active = eligibleBillingLeases.value;
+  if (!active.length) { notify('No active lease is available for billing.'); return; }
+  const today = new Date();
+  const month = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
+  Object.assign(billingForm, { leaseId: active[0].id, month, due: month, water: '0', electricity: '0', other: '0' });
+  billingError.value = '';
+  billingStep.value = 1;
+  billingModalOpen.value = true;
+}
+function advanceBilling() {
+  if (!chosenBillingLease.value) { billingError.value = 'Select an active lease first.'; return; }
+  billingError.value = '';
+  billingStep.value = 2;
+}
+async function submitMonthlyBill() {
+  if (financeSaving.value) return;
+  const lease = chosenBillingLease.value;
+  if (!lease) { billingStep.value = 1; billingError.value = 'Choose an active lease.'; return; }
+  if (!/^\d{4}-\d{2}-01$/.test(billingForm.month)) { billingError.value = 'Billing month must be a valid date on day 01.'; return; }
+  const billDate = new Date(`${billingForm.month}T12:00:00`);
+  const dueDate = new Date(`${billingForm.due}T12:00:00`);
+  if (Number.isNaN(billDate.getTime()) || billDate.toISOString().slice(0,10) !== billingForm.month ||
+      Number.isNaN(dueDate.getTime()) || dueDate.toISOString().slice(0,10) !== billingForm.due) {
+    billingError.value = 'Enter valid billing and due dates.'; return;
+  }
+  for (const label of ['water','electricity','other'] as const) {
+    const value = Number(billingForm[label]);
+    if (!billingForm[label].trim() || !Number.isFinite(value) || value < 0) {
+      billingError.value = 'Charges must be valid, nonnegative amounts.'; return;
+    }
+  }
+  billingError.value = '';
+  financeSaving.value = true;
+  try {
+    await createBill({ lease_id: lease.id, billing_period: billingForm.month, due_date: billingForm.due,
+      water_charge: Number(billingForm.water), electricity_charge: Number(billingForm.electricity), other_charges: Number(billingForm.other) });
+    billingModalOpen.value = false;
+    await refreshFinances();
+    notify('Monthly bill created. The tenant can now view the statement.');
+  } catch (error: any) {
+    billingError.value = error?.response?.data?.message || error?.message || 'Could not create the bill.';
+  } finally { financeSaving.value = false; }
+}
+function mapOwnerMaintenance(row:RentalMaintenanceRequest):Maintenance{return {id:Number(row.request_id),unitId:Number(row.unit_id),category:row.category||'General',description:row.problem_description,date:String(row.created_at).slice(0,10),status:String(row.status).toUpperCase().replaceAll('_',' '),priority:String(row.priority||'medium').toUpperCase(),tenant:row.tenant_name};}
+async function refreshOwnerMaintenance(){if(maintenanceLoading.value)return;maintenanceLoading.value=true;maintenanceError.value='';try{state.maintenance=(await listOwnerMaintenance()).map(mapOwnerMaintenance);}catch(e:any){maintenanceError.value=e?.response?.data?.message||e?.message||'Could not load maintenance requests.';}finally{maintenanceLoading.value=false;}}
+onMounted(async () => {
+  try {
+    const user = await restoreSession();
+    if (!user) {
+      await router.replace('/login');
+      return;
+    }
+    if (user.role !== 'owner') {
+      await router.replace(user.role === 'admin' ? '/admin' : user.role === 'tenant' ? '/tenant' : '/login');
+      return;
+    }
+    state.profile.name = user.name;
+    state.profile.email = user.email;
+    await refreshRentalCatalog();
+    await refreshOwnerApplications();
+    await refreshOwnerLeases();
+    await refreshFinances();
+    await refreshOwnerMaintenance();
+  } catch (error) {
+    console.error('Failed to restore owner session:', error);
+    message.value = 'Unable to verify your session.';
+  }
+});
+
 const section = ref('overview');
+const mobileMenuOpen = ref(false);
 const search = ref('');
 const statusFilter = ref('ALL');
 const propertyFilter = ref('ALL');
@@ -408,6 +645,11 @@ function navigate(target: string) {
   clearFilters();
   returnToOwnerProfile.value = false;
   section.value = target;
+  mobileMenuOpen.value = false;
+  if (target === 'pending' || target === 'history' || target === 'overview') void refreshOwnerApplications();
+  if (target === 'leases' || target === 'overview') void refreshOwnerLeases();
+  if (target === 'bills' || target === 'payments' || target === 'overview') void refreshFinances();
+  if (target === 'maintenance' || target === 'overview') void refreshOwnerMaintenance();
 }
 function viewProfileUnits(propertyId: number) {
   navigate('properties');
@@ -438,26 +680,31 @@ function escapeMessage(text: string): string {
   };
   return text.replace(/[&<>"']/g, character => entities[character]);
 }
-let notificationQueue: Promise<void> = Promise.resolve();
-let actionDialogOpen = false;
-function notify(text: string) {
-  message.value = text;
-  notificationQueue = notificationQueue
-    .then(async () => {
-      const alert = await alertController.create({
-        header: 'RentEase',
-        message: escapeMessage(text),
-        cssClass: 'rentease-messagebox',
-        backdropDismiss: false,
-        buttons: [{ text: 'OK', role: 'confirm' }],
-      });
-      await alert.present();
-      await alert.onDidDismiss();
-    })
-    .catch(error => {
-      console.error('Unable to show message:', error);
-    });
+type OwnerNotice = { title: string; detail: string; tone: 'success' | 'error' | 'info' };
+const currentNotice = ref<OwnerNotice | null>(null);
+const noticeQueue: OwnerNotice[] = [];
+function noticeTitle(text: string): string {
+  if (/fail|error|unable|could not|invalid|cannot|requires|enter a valid|not available/i.test(text)) return 'Action needs attention';
+  if (/lease/i.test(text)) return 'Lease update';
+  if (/payment|bill|balance/i.test(text)) return 'Billing update';
+  if (/application/i.test(text)) return 'Application update';
+  if (/maintenance|repair/i.test(text)) return 'Maintenance update';
+  if (/property|unit/i.test(text)) return 'Property update';
+  return 'RentEase update';
 }
+function notify(text: string) {
+  const detail = text.trim();
+  const tone = /fail|error|unable|could not|invalid|cannot|not available/i.test(detail) ? 'error' :
+    /saved|prepared|approved|rejected|updated|completed|verified|created|cleared|success/i.test(detail) ? 'success' : 'info';
+  noticeQueue.push({ title: noticeTitle(detail), detail, tone });
+  if (!currentNotice.value) currentNotice.value = noticeQueue.shift() || null;
+}
+function closeOwnerNotice() {
+  currentNotice.value = null;
+  // Let Ionic finish dismissing before presenting the next queued notice.
+}
+function showNextOwnerNotice() { if (!currentNotice.value) currentNotice.value = noticeQueue.shift() || null; }
+let actionDialogOpen = false;
 async function systemConfirm(
   text: string,
   title = 'Confirm action',
@@ -576,14 +823,9 @@ function unitLease(id: number): Lease | undefined {
   );
 }
 function unitStatus(id: number): string {
-  if (unitLease(id)) return 'OCCUPIED';
-  if (state.maintenance.some(
-    request => request.unitId === id && request.status !== 'COMPLETED',
-  )) {
-    return 'MAINTENANCE';
-  }
-  return 'AVAILABLE';
+  return state.units.find(unit => unit.id === id)?.status ?? 'UNKNOWN';
 }
+
 function billLease(bill: Bill): Lease | undefined {
   return state.leases.find(lease => lease.id === bill.leaseId);
 }
@@ -591,17 +833,13 @@ function billTenant(bill: Bill): string {
   return billLease(bill)?.tenant ?? 'Unknown tenant';
 }
 function verifiedTotal(billId: number): number {
-  return state.payments
-    .filter(payment =>
-      payment.billId === billId && payment.status === 'VERIFIED',
-    )
-    .reduce((total, payment) => total + payment.amount, 0);
+  return state.bills.find(b=>b.id===billId)?.verified ?? 0;
 }
 function balance(bill: Bill): number {
   return Math.max(0, bill.amount - verifiedTotal(bill.id));
 }
 function billStatus(bill: Bill): string {
-  if (balance(bill) === 0) return 'PAID';
+  if (balance(bill) <= 0.001) return 'PAID';
   if (daysUntil(bill.due) < 0) return 'OVERDUE';
   if (verifiedTotal(bill.id) > 0) return 'PARTIAL';
   return 'UNPAID';
@@ -708,7 +946,7 @@ const collections = computed(() =>
 const occupancy = computed(() =>
   state.units.length
     ? Math.round(
-        state.units.filter(unit => !!unitLease(unit.id)).length
+        state.units.filter(unit => unit.status === 'OCCUPIED').length
         / state.units.length * 100,
       )
     : 0,
@@ -849,7 +1087,7 @@ const filterOptions = computed(() => {
     history: ['APPROVED', 'REJECTED'],
     payments: ['PENDING', 'VERIFIED', 'REJECTED'],
     bills: ['UNPAID', 'PARTIAL', 'OVERDUE', 'PAID'],
-    leases: ['ACTIVE', 'COMPLETED'],
+    leases: ['PENDING', 'ACTIVE', 'COMPLETED'],
     maintenance: ['PENDING', 'ASSIGNED', 'IN PROGRESS', 'COMPLETED'],
   };
   return options[section.value] ?? [];
@@ -886,6 +1124,7 @@ function resetForm() {
     status: '',
   });
   formError.value = '';
+  unitSaveStatus.value = '';
 }
 function openDialog(type: string, id = 0) {
   resetForm();
@@ -969,77 +1208,120 @@ const dialogTitle = computed(() => {
   };
   return names[dialog.value] ?? 'Details';
 });
-function saveProperty() {
+async function saveProperty() {
+  if (savingRental.value) return;
   const name = form.name.trim();
   const address = form.address.trim();
   if (!name || !address) {
     formError.value = 'Enter the property name and address.';
     return;
   }
-  if (state.properties.some(property =>
-    property.id !== selectedId.value &&
-    property.name.toLowerCase() === name.toLowerCase(),
-  )) {
-    formError.value = 'A property with this name already exists.';
-    return;
+  savingRental.value = true;
+  formError.value = '';
+  try {
+    if (selectedId.value) {
+      await updateProperty(selectedId.value, { property_name: name, address });
+    } else {
+      await createProperty({ property_name: name, address });
+    }
+    await refreshRentalCatalog();
+    closeDialog();
+    notify('Property details saved successfully.');
+  } catch (error: any) {
+    formError.value = error?.response?.data?.message || error?.message || 'Unable to save property.';
+  } finally {
+    savingRental.value = false;
   }
-  const existing = state.properties.find(
-    property => property.id === selectedId.value,
-  );
-  if (existing) {
-    Object.assign(existing, { name, address });
-  } else {
-    state.properties.push({
-      id: nextId(state.properties),
-      name,
-      address,
-    });
-  }
-  activity(`Property "${name}" was ${existing ? 'updated' : 'added'}.`);
-  closeDialog();
-  notify('Property saved successfully.');
 }
-function saveUnit() {
+
+async function saveUnit() {
+  console.info('[RentEase] Save Unit button activated');
+  if (savingRental.value) return;
+
+  formError.value = '';
+  unitSaveStatus.value = '';
+
+  // Read the reactive form values at click time, rather than relying on
+  // native form validation to trigger a submit event inside IonModal.
   const propertyId = Number(form.propertyId);
-  const rent = Number(form.rent);
-  const bedrooms = Number(form.bedrooms);
-  const capacity = Number(form.capacity);
-  const number = form.number.trim();
-  if (
-    !number ||
-    !state.properties.some(property => property.id === propertyId) ||
-    !/^\d+(\.\d{1,2})?$/.test(form.rent.trim()) ||
-    !Number.isFinite(rent) ||
-    rent <= 0 ||
-    !form.bedrooms.trim() ||
-    !Number.isInteger(bedrooms) ||
-    bedrooms < 0 ||
-    !form.capacity.trim() ||
-    !Number.isInteger(capacity) ||
-    capacity < 1
-  ) {
-    formError.value = 'Enter a valid unit number, property, rent, bedrooms, and capacity.';
-    return;
-  }
-  if (state.units.some(unit =>
-    unit.id !== selectedId.value &&
-    unit.propertyId === propertyId &&
-    unit.number.toLowerCase() === number.toLowerCase(),
+  const unitNumber = form.number.trim();
+  const rentText = String(form.rent ?? '').trim();
+  const bedroomsText = String(form.bedrooms ?? '').trim();
+  const capacityText = String(form.capacity ?? '').trim();
+  const rent = Number(rentText);
+  const bedrooms = Number(bedroomsText);
+  const capacity = Number(capacityText);
+
+  if (!Number.isSafeInteger(propertyId) || !state.properties.some(p => p.id === propertyId)) {
+    formError.value = 'Please select a property that belongs to your account.';
+  } else if (!unitNumber) {
+    formError.value = 'Unit number is required.';
+  } else if (!rentText || !Number.isFinite(rent) || rent <= 0) {
+    formError.value = 'Monthly rent must be greater than zero.';
+  } else if (!bedroomsText || !Number.isInteger(bedrooms) || bedrooms < 0) {
+    formError.value = 'Bedrooms must be a whole number of zero or higher.';
+  } else if (!capacityText || !Number.isInteger(capacity) || capacity < 1) {
+    formError.value = 'Capacity must be a whole number of at least one.';
+  } else if (state.units.some(u =>
+    u.id !== selectedId.value && u.propertyId === propertyId &&
+    u.number.toLowerCase() === unitNumber.toLowerCase()
   )) {
     formError.value = 'This unit number already exists in the selected property.';
+  }
+
+  if (formError.value) {
+    console.warn('[RentEase] Unit form validation:', formError.value);
     return;
   }
-  const values = { propertyId, number, rent, bedrooms, capacity };
-  const existing = state.units.find(unit => unit.id === selectedId.value);
-  if (existing) {
-    Object.assign(existing, values);
-  } else {
-    state.units.push({ id: nextId(state.units), ...values });
+
+  const existingUnit = selectedId.value
+    ? state.units.find(u => u.id === selectedId.value)
+    : undefined;
+  if (selectedId.value && !existingUnit) {
+    formError.value = 'The selected unit no longer exists. Refresh the rental list.';
+    return;
   }
-  activity(`Unit ${number} was ${existing ? 'updated' : 'added'}.`);
-  closeDialog();
-  notify('Unit saved. Existing lease rent remains unchanged.');
+  if (existingUnit && existingUnit.propertyId !== propertyId) {
+    formError.value = 'You cannot move an existing unit to another property.';
+    return;
+  }
+
+  savingRental.value = true;
+  unitSaveStatus.value = 'Saving rental unit...';
+  const unitId = selectedId.value;
+  try {
+    const payload = {
+      unit_number: unitNumber,
+      monthly_rent: rent.toFixed(2),
+      bedrooms,
+      capacity,
+    };
+    console.info('[RentEase] Sending unit API request:', {
+      method: unitId ? 'PATCH' : 'POST', propertyId, unitId, payload,
+    });
+    const saved = unitId
+      ? await updateUnit(propertyId, unitId, payload)
+      : await createUnit(propertyId, payload);
+
+    // Do not claim success until the API has returned a valid database record.
+    if (!saved || !Number(saved.unit_id)) {
+      throw new Error('The server did not confirm that the unit was saved.');
+    }
+    console.info('[RentEase] PostgreSQL saved unit:', saved);
+    unitSaveStatus.value = `Unit ${saved.unit_number} saved successfully.`;
+    await refreshRentalCatalog();
+    closeDialog();
+    notify(`Unit ${saved.unit_number} saved successfully.`);
+  } catch (error: any) {
+    console.error('[RentEase] Save Unit failed:', error);
+    formError.value = error?.response?.data?.message || error?.message ||
+      'Unable to save unit. Check your backend connection.';
+    unitSaveStatus.value = '';
+  } finally {
+    savingRental.value = false;
+  }
 }
+
 function uploadAvatar(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0];
   if (!file) return;
@@ -1082,184 +1364,86 @@ function saveProfile() {
   notify('Profile saved successfully.');
 }
 async function reviewApplication(app: Application, approved: boolean) {
-  if (app.status !== 'PENDING') return;
+  if (reviewingApplication.value || app.status !== 'PENDING') return;
   if (approved && unitStatus(app.unitId) !== 'AVAILABLE') {
-    notify('This unit is no longer available. Review another unit or reject the application.');
-    return;
-  }
-  if (approved && daysUntil(app.moveIn) < 0) {
-    notify('The requested move-in date has passed. The application needs an updated date.');
+    notify('The unit is not available. Refresh the rental catalog before approving.');
     return;
   }
   const confirmed = await systemConfirm(
-    `${approved ? 'Approve' : 'Reject'} ${app.name}'s application?`,
+    `${approved ? 'Approve' : 'Reject'} ${app.name}'s application? ${approved ? 'This reserves the unit; lease creation will be a separate step.' : ''}`,
     approved ? 'Approve application' : 'Reject application',
     approved ? 'Approve' : 'Reject',
   );
   if (!confirmed) return;
-  if (
-    app.status !== 'PENDING' ||
-    !state.applications.includes(app)
-  ) return;
-  if (approved && unitStatus(app.unitId) !== 'AVAILABLE') {
-    notify('The unit is no longer available.');
-    return;
+  reviewingApplication.value = true;
+  try {
+    const saved = await reviewRentalApplication(app.id, approved ? 'approved' : 'rejected');
+    if (!saved?.application_id) throw new Error('Server did not confirm the decision.');
+    const refreshed = await refreshOwnerApplications();
+    await refreshRentalCatalog();
+    closeDialog();
+    notify(refreshed
+      ? (approved ? 'Application approved and unit reserved. Prepare a lease agreement when ready.' : 'Application rejected. The applicant can view the decision.')
+      : 'Your decision was saved, but the list could not refresh. Please reload the page.');
+  } catch (error: any) {
+    console.error('[RentEase] Application review failed:', error);
+    formError.value = error?.response?.data?.message || error?.message || 'Unable to review application.';
+    notify(`Review failed: ${formError.value}`);
+  } finally {
+    reviewingApplication.value = false;
   }
-  if (approved) {
-    const unit = state.units.find(item => item.id === app.unitId);
-    if (!unit) return;
-    const end = new Date(`${app.moveIn}T12:00:00`);
-    const startDay = end.getDate();
-    end.setDate(1);
-    end.setMonth(end.getMonth() + app.duration);
-    const lastDay = new Date(
-      end.getFullYear(),
-      end.getMonth() + 1,
-      0,
-    ).getDate();
-    end.setDate(Math.min(startDay, lastDay));
-    end.setDate(end.getDate() - 1);
-    const endDate = [
-      end.getFullYear(),
-      String(end.getMonth() + 1).padStart(2, '0'),
-      String(end.getDate()).padStart(2, '0'),
-    ].join('-');
-    state.leases.push({
-      id: nextId(state.leases),
-      unitId: app.unitId,
-      tenant: app.name,
-      start: app.moveIn,
-      end: endDate,
-      rent: unit.rent,
-      status: 'ACTIVE',
-    });
-  }
-  app.status = approved ? 'APPROVED' : 'REJECTED';
-  app.decided = dateOffset(0);
-  activity(`${app.name}'s application was ${app.status.toLowerCase()}.`);
-  closeDialog();
-  notify(
-    approved
-      ? 'Application approved. A lease was created and the unit reserved.'
-      : 'Application rejected. Unit availability was not changed.',
-  );
 }
-async function verifyPayment(payment: Payment) {
-  if (payment.status !== 'PENDING') return;
-  const bill = paymentBill(payment);
-  if (
-    !bill ||
-    !Number.isFinite(payment.amount) ||
-    payment.amount <= 0 ||
-    payment.amount > balance(bill)
-  ) {
-    notify('This payment exceeds the outstanding balance or has an invalid amount.');
-    return;
-  }
-  if (state.payments.some(item =>
-    item.id !== payment.id &&
-    item.status === 'VERIFIED' &&
-    item.method === payment.method &&
-    item.reference.trim().toLowerCase() ===
-      payment.reference.trim().toLowerCase(),
-  )) {
-    notify('This payment reference has already been verified.');
-    return;
-  }
-  const confirmed = await systemConfirm(
-    `Confirm receipt of ${peso(payment.amount)} from ${paymentTenant(payment)}?`,
-    'Verify payment',
-    'Verify payment',
-  );
-  if (!confirmed) return;
-  if (
-    payment.status !== 'PENDING' ||
-    !state.payments.includes(payment)
-  ) return;
-  if (payment.amount > balance(bill)) {
-    notify('The bill balance changed. Please review this payment again.');
-    return;
-  }
-  payment.status = 'VERIFIED';
-  activity(`Payment ${payment.reference} was verified.`);
-  closeDialog();
-  notify('Payment verified. Collections and the bill balance have been updated.');
-}
-async function rejectPayment(payment: Payment) {
-  if (payment.status !== 'PENDING') return;
-  const reason = await systemPrompt(
-    'Enter the reason for rejecting this payment.',
-  );
-  if (reason === null) return;
-  if (
-    payment.status !== 'PENDING' ||
-    !state.payments.includes(payment)
-  ) return;
-  payment.status = 'REJECTED';
-  payment.note = reason;
-  activity(`Payment ${payment.reference} was rejected.`);
-  closeDialog();
-  notify('Payment rejected. It does not count toward collections.');
-}
-const maintenanceTransitions: Record<string, string[]> = {
-  PENDING: ['PENDING', 'ASSIGNED'],
-  ASSIGNED: ['ASSIGNED', 'IN PROGRESS'],
-  'IN PROGRESS': ['IN PROGRESS', 'COMPLETED'],
-  COMPLETED: ['COMPLETED'],
+
+async function verifyPayment(payment:Payment){if(financeSaving.value||payment.status!=='PENDING')return;if(!await systemConfirm(`Verify payment ${peso(payment.amount)} from ${paymentTenant(payment)}?`,'Verify Payment','Verify'))return;financeSaving.value=true;try{await decidePayment(payment.id,'verified');await refreshFinances();closeDialog();notify('Payment verified. The tenant’s outstanding balance has been updated.');}catch(e:any){notify('Verification failed: '+(e?.response?.data?.message||e?.message||'Unknown error'));}finally{financeSaving.value=false;}}
+async function rejectPayment(payment:Payment){if(financeSaving.value||payment.status!=='PENDING')return;if(!await systemConfirm('Reject this payment?','Reject Payment','Reject'))return;financeSaving.value=true;try{await decidePayment(payment.id,'rejected');await refreshFinances();closeDialog();notify('Payment rejected. The tenant can review the payment status.');}catch(e:any){notify('Rejection failed: '+(e?.response?.data?.message||e?.message||'Unknown error'));}finally{financeSaving.value=false;}}
+const maintenanceTransitions:Record<string,string[]>={
+ PENDING:['ASSIGNED','CANCELLED'],ASSIGNED:['IN PROGRESS','CANCELLED'],
+ 'IN PROGRESS':['COMPLETED','CANCELLED'],COMPLETED:[],CANCELLED:[]
 };
-function updateMaintenance() {
-  const request = selectedMaintenance.value;
-  if (!request) return;
-  if (!maintenanceTransitions[request.status]?.includes(form.status)) {
-    formError.value = 'Choose a valid next status.';
-    return;
-  }
-  if (request.status !== form.status) {
-    request.status = form.status;
-    activity(
-      `${unitLabel(request.unitId)} maintenance changed to ${form.status.toLowerCase()}.`,
-    );
-  }
-  closeDialog();
-  notify('Maintenance status saved.');
+async function updateMaintenance(){
+ const request=selectedMaintenance.value;
+ if(!request||maintenanceSaving.value)return;
+ const next=form.status;
+ if(!maintenanceTransitions[request.status]?.includes(next)){
+  formError.value='Choose a valid next status.';return;
+ }
+ maintenanceSaving.value=true;formError.value='';
+ try{await updateMaintenanceStatus(request.id,next.toLowerCase().replaceAll(' ','_') as 'assigned'|'in_progress'|'completed'|'cancelled');
+  await refreshOwnerMaintenance();closeDialog();notify('Maintenance request status updated successfully.');
+ }catch(e:any){formError.value=e?.response?.data?.message||e?.message||'Unable to update maintenance.';notify(formError.value);}
+ finally{maintenanceSaving.value=false;}
 }
+
 async function completeLease(lease: Lease) {
-  if (lease.status !== 'ACTIVE') return;
-  const outstanding = state.bills
-    .filter(bill => bill.leaseId === lease.id)
-    .reduce((total, bill) => total + balance(bill), 0);
-  const text = outstanding > 0
-    ? `Complete ${lease.tenant}'s lease? The remaining balance of ${peso(outstanding)} will stay in Bills & Balances. Outstanding bills will not be cancelled.`
-    : `Complete ${lease.tenant}'s lease? The unit will become available unless it has an open maintenance request.`;
-  if (!await systemConfirm(
-    text,
-    'Complete lease',
-    'Complete lease',
-  )) return;
-  if (
-    lease.status !== 'ACTIVE' ||
-    !state.leases.includes(lease)
-  ) return;
-  lease.status = 'COMPLETED';
-  activity(`${lease.tenant}'s lease was completed.`);
-  closeDialog();
-  notify(
-    outstanding > 0
-      ? `Lease completed. The remaining balance of ${peso(outstanding)} is retained in Bills & Balances.`
-      : 'Lease completed. Unit availability has been updated.',
-  );
+  if (lease.status !== 'ACTIVE' || savingLease.value) return;
+  const ok = await systemConfirm(`Complete ${lease.tenant}'s lease? This changes the database record and may reopen the unit for new applications.`, 'Complete lease','Complete');
+  if (!ok) return;
+  savingLease.value = true;
+  try { await finishLease(lease.id);await Promise.all([refreshOwnerLeases(),refreshRentalCatalog()]);closeDialog();notify('Lease marked as completed. The rental unit status has been updated.'); }
+  catch(error:any){notify('Could not complete lease: '+(error?.response?.data?.message || error?.message || 'Unknown error'));}
+  finally{savingLease.value=false;}
 }
+
 async function resetDemo() {
   if (!await systemConfirm(
-    'Reset all local changes and restore the sample records?',
-    'Reset demonstration',
-    'Reset data',
+    'Clear temporary display information? This will not delete properties, leases, bills, or other rental records.',
+    'Clear temporary viewnstration',
+    'Clear temporary data',
   )) return;
-  Object.assign(state, seed());
+  // Do not restore demo properties or units over the PostgreSQL catalog.
+  state.applications = [];
+  state.leases = [];
+  state.bills = [];
+  state.payments = [];
+  state.maintenance = [];
+  state.activity = [];
+  await refreshFinances();
+  await refreshRentalCatalog();
+  await refreshOwnerApplications();
   closeDialog();
   clearFilters();
   returnToOwnerProfile.value = false;
-  notify('Sample records restored.');
+  notify('Temporary display data cleared. Your rental records remain unchanged.');
 }
 async function logout() {
   try {
@@ -1277,10 +1461,23 @@ async function logout() {
   <IonPage>
     <IonHeader>
       <IonToolbar class="topbar">
-        <IonTitle>
-          RentEase
-          <span class="brand-subtitle">Owner Portal</span>
-        </IonTitle>
+        <IonButtons slot="start" class="owner-brand-controls">
+          <button
+            type="button"
+            class="owner-menu-toggle"
+            aria-label="Toggle owner navigation"
+            aria-controls="owner-navigation"
+            :aria-expanded="mobileMenuOpen"
+            @click="mobileMenuOpen = !mobileMenuOpen"
+          >
+            <IonIcon :icon="menuOutline" />
+          </button>
+          <div class="owner-brand-mark"><IonIcon :icon="businessOutline" /></div>
+          <div class="owner-brand-text">
+            <strong>RentEase<span>.</span></strong>
+            <small>OWNER PORTAL</small>
+          </div>
+        </IonButtons>
         <IonButtons slot="end">
           <IonButton
             aria-label="Open pending payments"
@@ -1288,20 +1485,20 @@ async function logout() {
           >
             <IonIcon :icon="notificationsOutline" />
           </IonButton>
-          <IonButton
-  color="danger"
-  fill="solid"
-  @click="logout"
->
-  <IonIcon slot="start" :icon="logOutOutline" />
-  Logout
-</IonButton>
+
         </IonButtons>
       </IonToolbar>
     </IonHeader>
     <IonContent class="portal">
       <div class="layout">
-        <aside class="sidebar">
+        <button
+          v-if="mobileMenuOpen"
+          type="button"
+          class="owner-nav-backdrop"
+          aria-label="Close owner navigation"
+          @click="mobileMenuOpen = false"
+        ></button>
+        <aside id="owner-navigation" class="sidebar" :class="{ 'mobile-open': mobileMenuOpen }">
           <div class="owner">
             <div class="avatar">
               <img
@@ -1333,9 +1530,14 @@ async function logout() {
               </b>
             </button>
           </nav>
+          <button type="button" class="owner-sidebar-logout" @click="logout">
+            <IonIcon :icon="logOutOutline" />
+            <span>Logout</span>
+            <IonIcon :icon="chevronForwardOutline" class="logout-chevron" />
+          </button>
           <div class="sidebar-note">
-            <strong>Local demonstration</strong>
-            <p>Changes are saved in this browser only.</p>
+            <strong>Integration status</strong>
+            <p>Manage properties, rental agreements, payments, and maintenance in one place.</p>
           </div>
         </aside>
         <main class="workspace">
@@ -1383,6 +1585,33 @@ async function logout() {
             </button>
           </div>
           <template v-if="section === 'overview'">
+            <section class="welcome-hero">
+              <div class="hero-copy">
+                <span class="hero-kicker"><span class="live-dot"></span> OWNER WORKSPACE</span>
+                <h2>Good to see you, {{ state.profile.name.split(' ')[0] || 'Owner' }}!</h2>
+                <p>Here’s your rental portfolio at a glance. Keep track of your properties, tenants, and collections—all in one place.</p>
+                <div class="hero-actions">
+                  <button type="button" class="hero-button" @click="navigate('properties')">
+                    <IonIcon :icon="businessOutline" /> Manage properties <span>→</span>
+                  </button>
+                  <button type="button" class="hero-link" @click="navigate('pending')">
+                    Review applications <span>↗</span>
+                  </button>
+                </div>
+              </div>
+              <div class="hero-art" aria-hidden="true">
+                <div class="hero-orbit orbit-one"></div>
+                <div class="hero-orbit orbit-two"></div>
+                <div class="hero-building">
+                  <div class="building-roof"></div>
+                  <div class="building-windows">
+                    <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                  </div>
+                  <div class="building-door"></div>
+                </div>
+                <div class="floating-stat"><span>🏡</span><div><strong>{{ state.properties.length }} properties</strong><small>Your portfolio</small></div></div>
+              </div>
+            </section>
             <div class="metrics">
               <article class="metric">
                 <span>Verified Collections</span>
@@ -1625,7 +1854,7 @@ async function logout() {
                 <div class="panel-heading">
                   <div>
                     <h2>Recent Activity</h2>
-                    <p>Latest changes in this demonstration</p>
+                    <p>Activity log integration pending</p>
                   </div>
                 </div>
                 <ol class="activity-list">
@@ -1692,33 +1921,39 @@ async function logout() {
             </button>
           </div>
           <template v-if="section === 'properties'">
-            <div class="property-list">
-              <article
-                v-for="property in filteredProperties"
-                :key="property.id"
-                class="property-card"
-              >
-                <div class="property-symbol">
-                  <IonIcon :icon="businessOutline" />
+            <div v-if="propertiesLoading" class="notice">Loading your properties and rental units…</div>
+            <div v-else-if="rentalLoaded && !state.properties.length" class="notice">No properties in your account yet. Click Add Property to create one.</div>
+            <button type="button" class="button secondary" :disabled="propertiesLoading" @click="refreshRentalCatalog">Refresh properties</button>
+            <div class="property-list premium-property-list">
+              <article v-for="property in filteredProperties" :key="property.id" class="property-card owner-property-card">
+                <div class="property-cover">
+                  <div class="property-cover-top">
+                    <span class="property-cover-kicker"><IonIcon :icon="businessOutline" /> RENTAL PROPERTY</span>
+                    <span class="property-code">#{{ property.id }}</span>
+                  </div>
+                  <IonIcon :icon="businessOutline" class="property-cover-icon" />
+                  <div class="property-cover-bottom">
+                    <span class="property-location">⌖ {{ property.address }}</span>
+                    <span class="property-active-badge">REGISTERED</span>
+                  </div>
                 </div>
-                <div>
+                <div class="property-info">
+                  <p class="property-caption">PROPERTY OVERVIEW</p>
                   <h2>{{ property.name }}</h2>
-                  <p>{{ property.address }}</p>
-                  <small>
-                    {{
-                      state.units.filter(
-                        unit => unit.propertyId === property.id,
-                      ).length
-                    }} units
-                  </small>
+                  <div class="property-info-grid">
+                    <div class="property-info-tile">
+                      <span>Rental Units</span>
+                      <strong>{{ state.units.filter(unit => unit.propertyId === property.id).length }}</strong>
+                    </div>
+                    <div class="property-info-tile">
+                      <span>Property ID</span>
+                      <strong>#{{ property.id }}</strong>
+                    </div>
+                  </div>
+                  <button type="button" class="button primary property-view-button" @click="openDialog('property', property.id)">
+                    <span>Edit Property</span><IonIcon :icon="chevronForwardOutline" />
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  class="button secondary"
-                  @click="openDialog('property', property.id)"
-                >
-                  Edit
-                </button>
               </article>
             </div>
             <section class="panel">
@@ -1790,9 +2025,11 @@ async function logout() {
                 <h2>
                   {{ section === 'pending' ? 'Application Queue' : 'History' }}
                 </h2>
-                <p>{{ filteredApps.length }} records</p>
+                <p>{{ filteredApps.length }} applications</p>
               </div>
+              <button type="button" class="button secondary" :disabled="applicationsLoading" @click="refreshOwnerApplications">{{ applicationsLoading ? 'Loading...' : 'Refresh Applications' }}</button>
             </div>
+            <p v-if="applicationsError" role="alert" class="notice">{{ applicationsError }}</p>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -1844,6 +2081,8 @@ async function logout() {
               </table>
             </div>
           </section>
+          <div v-if="section === 'payments'" class="notice" role="status">Payment submission stores transaction details and reference numbers only; receipt image uploads are not enabled in this database schema.</div>
+          <button v-if="section === 'payments'" type="button" class="button secondary" :disabled="financeLoading" @click="refreshFinances">Refresh Payments</button>
           <section v-if="section === 'payments'" class="panel">
             <div class="panel-heading">
               <div>
@@ -1907,6 +2146,7 @@ async function logout() {
               </table>
             </div>
           </section>
+          <div v-if="section === 'bills'" class="heading-actions" style="margin-bottom:15px"><button type="button" class="button primary" :disabled="financeSaving" @click="issueBill">+ Create Monthly Bill</button><button type="button" class="button secondary" :disabled="financeLoading" @click="refreshFinances">Refresh Bills</button></div>
           <section v-if="section === 'bills'" class="panel">
             <div class="panel-heading">
               <div>
@@ -1977,6 +2217,9 @@ async function logout() {
                 <p>Completing a lease preserves its historical records.</p>
               </div>
             </div>
+            <div v-if="leasesError" class="notice" role="alert">{{ leasesError }}</div>
+            <button type="button" class="button secondary" :disabled="leasesLoading" @click="refreshOwnerLeases">{{ leasesLoading ? 'Loading...' : 'Refresh Leases' }}</button>
+            <p class="helper">Approved applications can be turned into pending leases from Application History. A tenant must confirm before activation.</p>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -2027,6 +2270,8 @@ async function logout() {
               </table>
             </div>
           </section>
+          <div v-if="section === 'maintenance'" class="heading-actions" style="margin-bottom:16px"><button type="button" class="button secondary" :disabled="maintenanceLoading" @click="refreshOwnerMaintenance">Refresh Maintenance</button></div>
+          <div v-if="section === 'maintenance' && maintenanceError" class="notice" role="alert">{{ maintenanceError }}</div>
           <div
             v-if="section === 'maintenance'"
             class="request-grid"
@@ -2044,7 +2289,7 @@ async function logout() {
                   {{ request.status }}
                 </span>
               </div>
-              <h2>{{ request.category }}</h2>
+              <h2>{{ request.category }}</h2><p class="muted">Reported by {{ request.tenant || 'Tenant' }} · Priority: {{ request.priority || 'MEDIUM' }}</p>
               <p class="muted">
                 {{ unitProperty(request.unitId) }} ·
                 {{ unitLabel(request.unitId) }}
@@ -2132,18 +2377,88 @@ async function logout() {
             </section>
           </div>
           <footer class="page-footer">
-            <span>RentEase · Local demo data</span>
+            <span>RentEase · Owner workspace</span>
             <button
               type="button"
               class="text-button"
               @click="resetDemo"
             >
-              Reset demo
+              Clear temporary view
             </button>
           </footer>
         </main>
       </div>
     </IonContent>
+
+    <!-- Full-size, accessible monthly billing workflow; replaces native dark alert radios. -->
+    <!-- Rental agreement preparation: branded form, not an Ionic alert -->
+    <IonModal class="owner-lease-modal" :is-open="leaseDialogOpen" :backdrop-dismiss="!savingLease" @didDismiss="closeLeasePreparation">
+      <div class="lease-modal-shell">
+        <header class="lease-modal-hero">
+          <div><span class="lease-modal-kicker">RENTEASE · RENTAL AGREEMENTS</span><h2>Prepare Lease Agreement</h2><p>Set the security deposit before sending the agreement to the tenant.</p></div>
+          <button type="button" class="lease-close" aria-label="Close lease preparation" :disabled="savingLease" @click="closeLeasePreparation"><IonIcon :icon="closeOutline" /></button>
+        </header>
+        <form class="lease-modal-body" @submit.prevent="submitLeasePreparation">
+          <div class="lease-summary" v-if="leaseDialogApplication">
+            <div><span>APPLICANT</span><strong>{{ leaseDialogApplication.name }}</strong></div>
+            <div><span>RENTAL UNIT</span><strong>{{ unitProperty(leaseDialogApplication.unitId) }} · {{ unitLabel(leaseDialogApplication.unitId) }}</strong></div>
+            <div><span>LEASE DURATION</span><strong>{{ leaseDialogApplication.duration }} months</strong></div>
+          </div>
+          <label class="lease-field" for="owner-lease-deposit">Security Deposit (PHP)
+            <span class="lease-money-input"><span>₱</span><input id="owner-lease-deposit" v-model="leaseDeposit" type="number" min="0" step="0.01" inputmode="decimal" required :disabled="savingLease" /></span>
+          </label>
+          <p class="lease-helper"><IonIcon :icon="timeOutline" /> The lease will remain pending until the tenant reviews and confirms it.</p>
+          <p v-if="leaseDialogError" class="lease-error" role="alert">{{ leaseDialogError }}</p>
+          <div class="lease-modal-actions"><button type="button" class="button secondary" :disabled="savingLease" @click="closeLeasePreparation">Cancel</button><button type="submit" class="button primary" :disabled="savingLease">{{ savingLease ? 'Preparing agreement...' : 'Prepare Lease' }}</button></div>
+        </form>
+      </div>
+    </IonModal>
+    <!-- Branded RentEase notices instead of black system alert dialogs -->
+    <IonModal class="owner-notice-modal" :is-open="currentNotice !== null" :backdrop-dismiss="false" @didDismiss="showNextOwnerNotice">
+      <div v-if="currentNotice" class="owner-notice-shell">
+        <div class="owner-notice-hero" :class="'notice-' + currentNotice.tone">
+          <span class="owner-notice-kicker">RENTEASE · OWNER PORTAL</span>
+          <div class="notice-symbol"><IonIcon :icon="currentNotice.tone === 'error' ? closeOutline : currentNotice.tone === 'success' ? checkmarkCircleOutline : notificationsOutline" /></div>
+        </div>
+        <div class="owner-notice-body"><h2>{{ currentNotice.title }}</h2><p>{{ currentNotice.detail }}</p><button type="button" class="button primary owner-notice-ok" @click="closeOwnerNotice">Got it</button></div>
+      </div>
+    </IonModal>
+    <IonModal :is-open="billingModalOpen" class="billing-workflow-modal" :backdrop-dismiss="!financeSaving" @didDismiss="closeBillingModal">
+      <IonHeader>
+        <IonToolbar class="billing-modal-toolbar">
+          <div slot="start" class="billing-modal-heading">
+            <span class="billing-eyebrow">BILLING WORKSPACE · STEP {{ billingStep }} OF 2</span>
+            <strong>Create Monthly Bill</strong>
+          </div>
+          <IonButtons slot="end"><IonButton aria-label="Close billing window" :disabled="financeSaving" @click="closeBillingModal"><IonIcon :icon="closeOutline" /></IonButton></IonButtons>
+        </IonToolbar>
+      </IonHeader>
+      <IonContent class="billing-modal-content">
+        <div class="billing-dialog-body">
+          <div class="billing-progress"><span :class="{ active: billingStep === 1, done: billingStep === 2 }">1 · Select Tenant</span><span :class="{ active: billingStep === 2 }">2 · Bill Charges</span></div>
+          <template v-if="billingStep === 1">
+            <div class="billing-lead"><h2>Select an active lease</h2><p>Choose the tenant and rental unit for this month's statement.</p></div>
+            <div class="billing-lease-options" role="radiogroup" aria-label="Active leases for billing">
+              <label v-for="lease in eligibleBillingLeases" :key="lease.id" class="billing-lease-option" :class="{ selected: billingForm.leaseId === lease.id }">
+                <input v-model.number="billingForm.leaseId" type="radio" name="billing-lease" :value="lease.id" />
+                <span class="billing-lease-avatar">{{ lease.tenant.slice(0,1).toUpperCase() }}</span>
+                <span class="billing-lease-copy"><strong>{{ lease.tenant }}</strong><small>{{ unitProperty(lease.unitId) }} · {{ unitLabel(lease.unitId) }}</small></span>
+                <span class="billing-lease-rent">{{ peso(lease.rent) }}<small>/ month</small></span>
+              </label>
+            </div>
+          </template>
+          <form v-else id="billing-new-form" class="billing-charge-form" @submit.prevent="submitMonthlyBill">
+            <div class="billing-selected-summary"><span>Billing for</span><strong>{{ chosenBillingLease?.tenant }} · {{ chosenBillingLease ? unitLabel(chosenBillingLease.unitId) : '' }}</strong><small>Base rent: {{ peso(chosenBillingLease?.rent || 0) }}</small></div>
+            <div class="billing-date-grid"><label>Billing Period<input v-model="billingForm.month" type="date" required /><small>Choose the first day of the billing month.</small></label><label>Payment Due Date<input v-model="billingForm.due" type="date" required /></label></div>
+            <p class="billing-subheading">Additional charges</p>
+            <div class="billing-charges-grid"><label>Water (₱)<input v-model="billingForm.water" type="number" min="0" step="0.01" required /></label><label>Electricity (₱)<input v-model="billingForm.electricity" type="number" min="0" step="0.01" required /></label><label>Other (₱)<input v-model="billingForm.other" type="number" min="0" step="0.01" required /></label></div>
+            <div class="billing-total-box"><span>Estimated bill total<small>Base rent + additional charges</small></span><strong>{{ peso(estimatedBillTotal) }}</strong></div>
+          </form>
+          <p v-if="billingError" class="billing-error" role="alert">{{ billingError }}</p>
+        </div>
+      </IonContent>
+      <div class="billing-dialog-footer"><button type="button" class="button secondary" :disabled="financeSaving" @click="billingStep === 1 ? closeBillingModal() : (billingStep = 1, billingError = '')">{{ billingStep === 1 ? 'Cancel' : 'Back' }}</button><button v-if="billingStep === 1" type="button" class="button primary" @click="advanceBilling">Continue to Charges →</button><button v-else type="submit" form="billing-new-form" class="button primary" :disabled="financeSaving">{{ financeSaving ? 'Creating Bill...' : 'Create Monthly Bill' }}</button></div>
+    </IonModal>
     <IonModal
       :is-open="dialogOpen"
       class="record-modal"
@@ -2151,7 +2466,10 @@ async function logout() {
     >
       <IonHeader>
         <IonToolbar class="modal-toolbar">
-          <IonTitle>{{ dialogTitle }}</IonTitle>
+          <IonTitle>
+            <div class="owner-dialog-kicker">RENTEASE · OWNER WORKSPACE</div>
+            <div class="owner-dialog-title">{{ dialogTitle }}</div>
+          </IonTitle>
           <IonButtons slot="end">
             <IonButton
               aria-label="Close dialog"
@@ -2201,12 +2519,13 @@ async function logout() {
                 Cancel
               </button>
               <button class="button primary" type="submit">
-                Save Property
+                {{ savingRental ? 'Saving…' : 'Save Property' }}
               </button>
             </div>
           </form>
           <form
             v-if="dialog === 'unit'"
+            novalidate
             @submit.prevent="saveUnit"
           >
             <label>
@@ -2263,19 +2582,26 @@ async function logout() {
               </label>
             </div>
             <p class="helper">
-              Availability follows leases and maintenance records.
-              Changing this rate does not change existing agreements.
+              Rental unit details and availability are kept up to date.
             </p>
+            <p v-if="formError" class="form-error" role="alert">{{ formError }}</p>
+            <p v-if="unitSaveStatus" class="helper" role="status">{{ unitSaveStatus }}</p>
             <div class="dialog-actions">
               <button
                 type="button"
                 class="button secondary"
+                :disabled="savingRental"
                 @click="closeDialog"
               >
                 Cancel
               </button>
-              <button class="button primary" type="submit">
-                Save Unit
+              <button
+                type="button"
+                class="button primary"
+                :disabled="savingRental"
+                @click.stop="saveUnit"
+              >
+                {{ savingRental ? 'Saving to database…' : selectedId ? 'Update Unit' : 'Save Unit' }}
               </button>
             </div>
           </form>
@@ -2361,8 +2687,8 @@ async function logout() {
               <dd>{{ readableDate(selectedApp.moveIn) }}</dd>
               <dt>Duration</dt>
               <dd>{{ selectedApp.duration }} months</dd>
-              <dt>Submitted</dt>
-              <dd>{{ readableDate(selectedApp.submitted) }}</dd>
+              <dt v-if="selectedApp.submitted">Submitted</dt>
+              <dd v-if="selectedApp.submitted">{{ readableDate(selectedApp.submitted) }}</dd>
               <template v-if="selectedApp.decided">
                 <dt>Decision date</dt>
                 <dd>{{ readableDate(selectedApp.decided) }}</dd>
@@ -2375,6 +2701,7 @@ async function logout() {
               <button
                 type="button"
                 class="button danger-button"
+                :disabled="reviewingApplication"
                 @click="reviewApplication(selectedApp, false)"
               >
                 Reject
@@ -2382,9 +2709,15 @@ async function logout() {
               <button
                 type="button"
                 class="button primary"
+                :disabled="reviewingApplication"
                 @click="reviewApplication(selectedApp, true)"
               >
-                Approve &amp; Create Lease
+                {{ reviewingApplication ? 'Saving...' : 'Approve & Reserve Unit' }}
+              </button>
+            </div>
+            <div v-if="selectedApp.status === 'APPROVED'" class="dialog-actions">
+              <button type="button" class="button primary" :disabled="savingLease" @click="createLeaseFromApplication(selectedApp)">
+                {{ savingLease ? 'Preparing...' : 'Prepare Lease Agreement' }}
               </button>
             </div>
           </template>
@@ -2426,8 +2759,7 @@ async function logout() {
               alt="Submitted payment evidence"
             />
             <p v-else class="helper">
-              No proof image is attached to this sample record.
-              Verification records an owner confirmation.
+              No receipt image is stored. Verify payment details and reference against your own transaction records before confirming.
             </p>
             <div
               v-if="selectedPayment.status === 'PENDING'"
@@ -2536,6 +2868,8 @@ async function logout() {
               <dd>{{ readableDate(selectedLease.end) }}</dd>
               <dt>Monthly rent</dt>
               <dd>{{ peso(selectedLease.rent) }}</dd>
+              <dt>Security deposit</dt>
+              <dd>{{ peso(selectedLease.deposit || 0) }}</dd>
               <dt>Outstanding balance</dt>
               <dd>{{ peso(selectedLeaseBalance) }}</dd>
             </dl>
@@ -2566,7 +2900,7 @@ async function logout() {
               {{ unitProperty(selectedMaintenance.unitId) }} ·
               {{ unitLabel(selectedMaintenance.unitId) }}
             </p>
-            <p>{{ selectedMaintenance.description }}</p>
+            <p>{{ selectedMaintenance.description }}</p><p class="muted">Tenant: {{ selectedMaintenance.tenant }} · Priority: {{ selectedMaintenance.priority }}</p>
             <dl class="details">
               <dt>Reported</dt>
               <dd>{{ readableDate(selectedMaintenance.date) }}</dd>
@@ -2585,9 +2919,7 @@ async function logout() {
                 </option>
               </select>
             </label>
-            <p class="helper">
-              Workflow: Pending → Assigned → In Progress → Completed.
-            </p>
+            <p class="helper">Workflow: Pending → Assigned → In Progress → Completed. Cancel is also available before completion.</p><p v-if="formError" class="helper" role="alert">{{ formError }}</p>
             <div class="dialog-actions">
               <button
                 type="button"
@@ -2596,8 +2928,8 @@ async function logout() {
               >
                 Cancel
               </button>
-              <button class="button primary" type="submit">
-                Save Status
+              <button class="button primary" type="submit" :disabled="maintenanceSaving || !maintenanceTransitions[selectedMaintenance.status]?.length">
+                {{ maintenanceSaving ? 'Saving...' : 'Save Status' }}
               </button>
             </div>
           </form>
@@ -3649,4 +3981,665 @@ textarea:focus-visible {
     transition: none;
   }
 }
+
+/* Engaging dashboard refresh */
+.portal {
+  --background: #f3f6fb;
+}
+.topbar {
+  box-shadow: 0 5px 20px rgba(8, 27, 53, .13);
+  position: relative;
+  z-index: 2;
+}
+.layout {
+  grid-template-columns: 258px minmax(0, 1fr);
+}
+.sidebar {
+  box-shadow: 8px 0 28px rgba(20, 43, 73, .025);
+}
+.sidebar nav button {
+  min-height: 47px;
+  border-radius: 12px;
+  font-size: 12.5px;
+}
+.sidebar nav button.active {
+  box-shadow: inset 3px 0 0 #0b7068;
+}
+.workspace {
+  max-width: 1700px;
+  width: 100%;
+  margin-inline: auto;
+}
+.page-heading {
+  margin-bottom: 28px;
+}
+h1 {
+  font-size: clamp(26px, 2.5vw, 34px);
+  letter-spacing: -1.1px;
+  font-weight: 850;
+}
+.subtitle {
+  max-width: 650px;
+  line-height: 1.65;
+}
+.welcome-hero {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 240px;
+  overflow: hidden;
+  padding: clamp(24px, 3vw, 40px);
+  margin: 0 0 22px;
+  border-radius: 24px;
+  color: #fff;
+  background: linear-gradient(115deg, #142b49 0%, #174a60 56%, #0b7068 100%);
+  box-shadow: 0 18px 42px rgba(20, 43, 73, .14);
+}
+.welcome-hero::before,
+.welcome-hero::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  border: 1px solid rgba(255,255,255,.12);
+  border-radius: 50%;
+}
+.welcome-hero::before {
+  width: 390px;
+  height: 390px;
+  right: 2%;
+  top: -245px;
+}
+.welcome-hero::after {
+  width: 280px;
+  height: 280px;
+  right: 11%;
+  bottom: -215px;
+}
+.hero-copy {
+  max-width: 620px;
+  position: relative;
+  z-index: 1;
+}
+.hero-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #a9e6d8;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 1.7px;
+}
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #70e1b5;
+  box-shadow: 0 0 0 4px rgba(112,225,181,.13);
+}
+.welcome-hero h2 {
+  margin: 15px 0 10px;
+  color: #fff;
+  font-size: clamp(25px, 3vw, 36px);
+  font-weight: 850;
+  letter-spacing: -1.1px;
+  line-height: 1.15;
+}
+.welcome-hero p {
+  max-width: 520px;
+  margin: 0;
+  color: #d9e8ef;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  margin-top: 24px;
+}
+.hero-button,
+.hero-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 750;
+  transition: transform .18s, background .18s;
+}
+.hero-button {
+  padding: 12px 15px;
+  border-radius: 11px;
+  color: #14324b;
+  background: #fff;
+  box-shadow: 0 6px 16px rgba(0,0,0,.12);
+}
+.hero-button ion-icon {
+  font-size: 17px;
+  color: #0b7068;
+}
+.hero-button:hover {
+  transform: translateY(-2px);
+  background: #e8fbf5;
+}
+.hero-link {
+  padding: 10px 0;
+  color: #fff;
+  background: transparent;
+}
+.hero-link:hover {
+  color: #a9e6d8;
+}
+.hero-art {
+  position: relative;
+  flex: 0 0 255px;
+  height: 200px;
+  display: grid;
+  place-items: center;
+}
+.hero-orbit {
+  position: absolute;
+  border: 1px solid rgba(255,255,255,.19);
+  border-radius: 50%;
+}
+.orbit-one { width: 210px; height: 210px; }
+.orbit-two { width: 160px; height: 160px; }
+.hero-building {
+  position: relative;
+  width: 105px;
+  height: 122px;
+  margin-top: 18px;
+  padding: 20px 13px 0;
+  border: 2px solid rgba(255,255,255,.8);
+  border-bottom: 0;
+  border-radius: 8px 8px 0 0;
+  background: linear-gradient(150deg, rgba(255,255,255,.28), rgba(255,255,255,.08));
+  box-shadow: 0 0 38px rgba(164,244,221,.15);
+}
+.building-roof {
+  position: absolute;
+  top: -17px;
+  left: -9px;
+  width: 119px;
+  height: 18px;
+  border: 2px solid rgba(255,255,255,.8);
+  border-radius: 5px 5px 2px 2px;
+  background: #2c7180;
+}
+.building-windows {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+.building-windows i {
+  display: block;
+  height: 16px;
+  border: 1px solid rgba(255,255,255,.75);
+  border-radius: 2px;
+  background: rgba(183,244,225,.58);
+}
+.building-door {
+  position: absolute;
+  bottom: 0;
+  left: 37px;
+  width: 28px;
+  height: 36px;
+  border: 2px solid rgba(255,255,255,.8);
+  border-bottom: 0;
+  border-radius: 5px 5px 0 0;
+  background: rgba(20,43,73,.6);
+}
+.floating-stat {
+  position: absolute;
+  right: -3px;
+  bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,.3);
+  border-radius: 14px;
+  background: rgba(255,255,255,.96);
+  color: #142b49;
+  box-shadow: 0 12px 30px rgba(0,0,0,.15);
+}
+.floating-stat > span { font-size: 23px; }
+.floating-stat strong { display: block; font-size: 12px; white-space: nowrap; }
+.floating-stat small { display: block; margin-top: 3px; color: #64748b; font-size: 10px; }
+.metrics {
+  gap: 15px;
+  margin-bottom: 22px;
+}
+.metric {
+  position: relative;
+  overflow: hidden;
+  padding: 22px 21px;
+  border: 1px solid #e7edf5;
+  border-radius: 17px;
+  background: linear-gradient(145deg, #fff, #fbfdff);
+  box-shadow: 0 7px 22px rgba(20,43,73,.035);
+  transition: transform .2s, box-shadow .2s;
+}
+.metric:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 13px 28px rgba(20,43,73,.08);
+}
+.metric::after {
+  content: "";
+  position: absolute;
+  width: 72px;
+  height: 72px;
+  right: -32px;
+  top: -32px;
+  border-radius: 50%;
+  background: #e8f5f2;
+}
+.metric strong {
+  font-size: clamp(22px, 2vw, 29px);
+  letter-spacing: -.8px;
+}
+.panel {
+  border: 1px solid #e6ecf4;
+  border-radius: 17px;
+  box-shadow: 0 7px 24px rgba(20,43,73,.035);
+  transition: box-shadow .2s, border-color .2s;
+}
+.panel:hover {
+  border-color: #dce7ed;
+  box-shadow: 0 10px 28px rgba(20,43,73,.055);
+}
+.panel-heading h2 {
+  letter-spacing: -.35px;
+}
+.attention {
+  border-radius: 12px;
+  margin: 3px 0;
+  transition: background .18s, transform .18s;
+}
+.attention:hover {
+  background: #f2f8f7;
+  transform: translateX(3px);
+}
+.unit-tile {
+  border-radius: 12px;
+  border-color: #e5edf3;
+  transition: transform .18s, box-shadow .18s;
+}
+.unit-tile:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 18px rgba(20,43,73,.06);
+}
+.property-card {
+  border-radius: 16px;
+  border: 1px solid #e5edf3;
+  box-shadow: 0 6px 18px rgba(20,43,73,.035);
+}
+.property-symbol {
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px rgba(11,112,104,.08);
+}
+.filters {
+  border: 1px solid #e5edf3;
+  border-radius: 16px;
+  box-shadow: 0 5px 20px rgba(20,43,73,.025);
+}
+input:focus,
+textarea:focus,
+select:focus {
+  outline: 3px solid rgba(11,112,104,.14);
+  border-color: #0b7068 !important;
+}
+button:focus-visible {
+  outline: 3px solid rgba(11,112,104,.45);
+  outline-offset: 3px;
+}
+.table-wrap {
+  border-radius: 12px;
+}
+tbody tr {
+  transition: background .15s;
+}
+tbody tr:hover {
+  background: #f7fafc;
+}
+.page-footer {
+  border-top: 1px solid #e3eaf2;
+}
+@media (max-width: 1000px) {
+  .layout { grid-template-columns: 220px minmax(0, 1fr); }
+  .hero-art { flex-basis: 205px; transform: scale(.9); margin-right: -12px; }
+}
+@media (max-width: 760px) {
+  .layout { display: block; }
+  .sidebar {
+    padding: 14px 14px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .owner { padding-bottom: 13px; }
+  .sidebar .nav-label { margin-top: 15px; }
+  .sidebar nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 5px;
+  }
+  .sidebar nav button {
+    width: auto;
+    min-width: max-content;
+    min-height: 40px;
+  }
+  .sidebar-note { display: none; }
+  .workspace { padding: 20px 14px 28px; }
+  .welcome-hero { min-height: auto; padding: 25px 22px; border-radius: 19px; }
+  .hero-art { display: none; }
+  .welcome-hero h2 { font-size: 27px; }
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 420px) {
+  .metrics { grid-template-columns: 1fr; }
+  .hero-actions { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .topbar { padding-inline: 4px; }
+  .topbar ion-title { font-size: 19px; }
+  .brand-subtitle { margin-left: 6px; font-size: 10px; }
+}
+
+
+/* RentEase premium blue design system — Owner Dashboard */
+.portal, .dialog-content {
+  --navy: #173562;
+  --teal: #2167da;
+  --line: #e0e9fa;
+  --muted: #667d9e;
+}
+.portal { --background: #edf3ff; }
+.topbar {
+  --background: #fff;
+  --color: #152f59;
+  --min-height: 67px;
+  box-shadow: 0 4px 20px rgba(17,59,130,.075);
+  padding-inline: 12px;
+}
+.owner-brand-controls { display:flex;align-items:center;gap:10px;margin-left:8px; }
+.owner-brand-mark { display:grid;place-items:center;width:39px;height:39px;border-radius:13px;background:linear-gradient(135deg,#1455c7,#2287eb);color:#fff;box-shadow:0 5px 13px rgba(28,91,200,.23);font-size:20px; }
+.owner-brand-text { display:flex;flex-direction:column;gap:2px; }
+.owner-brand-text strong { color:#173562;font-size:19px;letter-spacing:-.7px;line-height:1.1; }
+.owner-brand-text strong span {color:#21a3ed}
+.owner-brand-text small {color:#8b9cb5;font-size:9px;letter-spacing:1.4px;font-weight:800}
+.owner-menu-toggle { display:none;border:0;background:#edf4ff;color:#1858ba;border-radius:11px;width:42px;height:42px;cursor:pointer;font-size:22px;place-items:center; }
+.topbar ion-button { --color:#1b55ac;color:#1b55ac; }
+.topbar ion-button[color="danger"] { --background:linear-gradient(115deg,#1d62d6,#156bdc);--color:white;--border-radius:11px; }
+.layout { display:grid;grid-template-columns:250px minmax(0,1fr);gap:18px;align-items:start;padding:13px;min-width:0; }
+.sidebar {
+  position:sticky;top:13px;align-self:start;min-width:0;
+  width:250px;max-height:calc(100dvh - 26px);height:auto;overflow-y:auto;
+  border:1px solid rgba(255,255,255,.12);border-radius:23px;
+  padding:16px 12px;background:linear-gradient(166deg,#073782 0%,#1050b3 55%,#145ec9 100%);
+  color:#fff;box-shadow:0 15px 32px rgba(13,66,152,.18);
+}
+.owner { border:1px solid rgba(255,255,255,.17);border-radius:14px;padding:12px;background:rgba(255,255,255,.13);margin-bottom:14px; }
+.owner strong {color:#fff;font-size:12px}
+.owner small {color:#cbdfff}
+.avatar { background:#fff;color:#1454be; }
+.nav-label {color:#cbdfff;margin:15px 12px 10px}
+.sidebar nav {flex-direction:column;gap:7px}
+.sidebar nav button {min-height:46px;color:#e4efff;border-radius:12px;font-weight:650;font-size:12px}
+.sidebar nav button:hover {background:rgba(255,255,255,.12);color:#fff}
+.sidebar nav button.active {background:#fff;color:#164fae;border-color:#fff;box-shadow:0 8px 18px rgba(4,29,76,.19)}
+.sidebar nav b {background:#ffefca;color:#a45a00}
+.sidebar-note {margin-top:16px;padding:14px;background:rgba(255,255,255,.11);border:1px solid rgba(255,255,255,.13);border-radius:15px}
+.sidebar-note strong,.sidebar-note p {color:#fff}
+.sidebar-note p {color:#d4e5ff}
+.workspace {min-width:0;max-width:none;padding:19px clamp(10px,1.3vw,22px) 28px}
+.page-heading h1,.page-heading h2,h1 {color:#183562}
+.eyebrow {color:#2866ce}
+.welcome-hero {background:linear-gradient(118deg,#063b8d,#125cc0 61%,#249de2);box-shadow:0 18px 38px rgba(20,77,168,.2)}
+.welcome-hero::before {background:radial-gradient(circle at 70% 10%,rgba(185,224,255,.23),transparent 32%)}
+.panel,.metric,.filters {border:1px solid #e0e9fa;border-radius:18px;box-shadow:0 8px 25px rgba(28,70,141,.065)}
+.metric {position:relative;overflow:hidden;background:linear-gradient(150deg,#fff 50%,#f1f7ff);padding:20px}
+.metric::before {content:'';position:absolute;left:0;top:0;right:0;height:4px;background:linear-gradient(90deg,#1b5bd5,#3fa9ef)}
+.metric:nth-child(2)::before {background:linear-gradient(90deg,#0ca18c,#20d1ae)}
+.metric:nth-child(3)::before {background:linear-gradient(90deg,#f39a25,#ffc36e)}
+.metric:nth-child(4)::before {background:linear-gradient(90deg,#9b65e5,#d8a2ff)}
+.metric strong {color:#153564}
+.button.primary,.hero-button {border:0;background:linear-gradient(115deg,#1d5fd4,#187ee8);color:white;box-shadow:0 6px 16px rgba(26,97,214,.16)}
+.button.secondary {background:#f6f9ff;color:#1c5ab9;border:1px solid #d3e2fc}
+.button,.hero-button {display:inline-flex;align-items:center;justify-content:center;gap:9px;min-height:42px;border-radius:11px;font-weight:750;transition:transform .17s,box-shadow .17s,filter .17s}
+.button:hover,.hero-button:hover {transform:translateY(-1px);filter:brightness(1.025)}
+.button:focus-visible,.owner-menu-toggle:focus-visible {outline:3px solid #86b9ff;outline-offset:2px}
+.table-wrap {border:1px solid #e0e9fa;border-radius:15px;max-width:100%;overflow-x:auto}
+table {min-width:620px}
+th {background:linear-gradient(180deg,#f2f7ff,#eaf2ff);color:#5b779c;letter-spacing:.35px}
+td {border-color:#ebf1fa}
+tbody tr:nth-child(even) {background:#f9fbff}
+tbody tr:hover {background:#eef5ff}
+.pill {border-radius:9px}
+.premium-property-list {gap:18px}
+.owner-property-card {display:block;padding:0;overflow:hidden;border-radius:20px;border:1px solid #dfe8f8;background:white;box-shadow:0 13px 28px rgba(22,61,127,.08);transition:transform .2s,box-shadow .2s}
+.owner-property-card:hover {transform:translateY(-3px);box-shadow:0 19px 35px rgba(22,61,127,.14)}
+.property-cover {position:relative;display:flex;flex-direction:column;justify-content:space-between;min-height:165px;padding:17px 18px;color:white;background:linear-gradient(126deg,#123b9e,#2377db 59%,#49b0ef);overflow:hidden}
+.property-cover::after {content:'';position:absolute;right:-65px;bottom:-115px;width:250px;height:250px;border-radius:50%;border:35px solid rgba(255,255,255,.10)}
+.property-cover-top,.property-cover-bottom {display:flex;align-items:center;justify-content:space-between;gap:9px;position:relative;z-index:1}
+.property-cover-kicker {display:flex;align-items:center;gap:7px;font-size:10px;font-weight:850;letter-spacing:1.2px}
+.property-code {font-weight:800;font-size:11px;padding:5px 9px;background:rgba(255,255,255,.17);border-radius:8px}
+.property-cover-icon {align-self:center;font-size:65px;color:#fff;filter:drop-shadow(0 9px 15px rgba(10,42,108,.28));position:relative;z-index:1}
+.property-location {font-size:11px;line-height:1.5;overflow-wrap:anywhere}
+.property-active-badge {font-size:9px;font-weight:850;border-radius:999px;padding:6px 9px;background:rgba(255,255,255,.94);color:#1959be;white-space:nowrap}
+.property-info {padding:20px}
+.property-caption {font-size:10px;letter-spacing:1.4px;color:#7e95b3;font-weight:850;margin:0 0 7px}
+.owner-property-card .property-info h2 {font-size:19px;letter-spacing:-.4px;margin:0 0 15px;color:#153568}
+.property-info-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin-bottom:16px}
+.property-info-tile {border:1px solid #e0eafd;border-radius:12px;background:linear-gradient(180deg,#fbfdff,#f1f6ff);padding:12px}
+.property-info-tile span {display:block;font-size:10px;color:#7387a4;margin-bottom:5px}
+.property-info-tile strong {font-size:17px;color:#173c7b}
+.property-view-button {display:flex;width:100%;justify-content:space-between;padding:11px 16px}
+.property-view-button ion-icon {font-size:18px}
+.owner-nav-backdrop {display:none}
+@media(max-width:900px){
+  .layout {grid-template-columns:220px minmax(0,1fr);gap:11px}
+  .sidebar {width:220px}
+  .property-list {grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  .layout {display:block;padding:0;min-width:0}
+  .owner-menu-toggle {display:grid}
+  .owner-brand-controls {gap:7px;margin-left:3px}
+  .owner-brand-mark {width:35px;height:35px}
+  .owner-brand-text strong {font-size:16px}
+  .owner-brand-text small {font-size:7px}
+  .topbar {padding-inline:5px}
+  .topbar ion-button {font-size:11px}
+  .sidebar {display:none !important;position:fixed;z-index:1002;top:0;left:0;bottom:0;width:min(290px,85vw);max-height:100dvh;border-radius:0 20px 20px 0;overflow-y:auto;padding:calc(18px + env(safe-area-inset-top,0px)) 12px calc(18px + env(safe-area-inset-bottom,0px))}
+  .sidebar.mobile-open {display:block !important}
+  .sidebar nav {flex-direction:column;overflow:visible}
+  .sidebar nav button {width:100%;min-width:0;white-space:normal}
+  .nav-label,.sidebar-note {display:block}
+  .owner-nav-backdrop {display:block;position:fixed;inset:0;z-index:1001;border:0;background:rgba(6,20,49,.56);backdrop-filter:blur(3px)}
+  .workspace {width:100%;max-width:100%;padding:18px 13px calc(28px + env(safe-area-inset-bottom,0px))}
+  .page-heading {flex-wrap:wrap}
+  .heading-actions {width:100%;display:flex;flex-wrap:wrap}
+  .heading-actions .button {flex:1 1 auto}
+  .metrics {grid-template-columns:repeat(2,minmax(0,1fr))}
+  .property-list {grid-template-columns:1fr}
+  .table-wrap {-webkit-overflow-scrolling:touch}
+}
+@media(max-width:420px){
+  .owner-brand-text strong {font-size:14px}
+  .brand-subtitle {display:none}
+  .metrics {grid-template-columns:1fr}
+  .property-cover {min-height:153px}
+  .property-info {padding:16px}
+}
+
+
+/* Owner-specific premium detail experience — independent of the Admin theme */
+.owner-sidebar-logout {
+  width:100%;display:flex;align-items:center;gap:12px;min-height:46px;margin-top:15px;
+  padding:11px 13px;border-radius:12px;cursor:pointer;text-align:left;
+  border:1px solid rgba(255,255,255,.23);background:rgba(255,255,255,.13);
+  color:#fff;font-weight:800;font-size:12px;transition:background .18s,transform .18s;
+}
+.owner-sidebar-logout ion-icon {font-size:18px;flex-shrink:0}
+.owner-sidebar-logout .logout-chevron {margin-left:auto;font-size:15px;opacity:.7}
+.owner-sidebar-logout:hover {background:rgba(255,255,255,.23);transform:translateY(-1px)}
+.owner-sidebar-logout:focus-visible {outline:3px solid #8ac4ff;outline-offset:2px}
+.sidebar-note {margin-top:12px}
+.record-modal {--width:min(665px,calc(100% - 28px));--height:auto;--max-height:90%;--border-radius:24px;--box-shadow:0 28px 85px rgba(6,26,70,.26)}
+.record-modal::part(content) {border-radius:24px;overflow:hidden}
+.modal-toolbar {
+  --background:linear-gradient(116deg,#083a84 0%,#176dc2 58%,#168fbd 100%);
+  --color:#fff;--border-color:transparent;--min-height:103px;
+  color:#fff;position:relative;
+}
+.modal-toolbar ion-title {color:#fff;--color:#fff;padding-top:16px;padding-bottom:16px;white-space:normal}
+.modal-toolbar ion-button {--color:#fff;color:#fff;--background:rgba(255,255,255,.13);--border-radius:11px;width:39px;height:39px}
+.owner-dialog-kicker {color:#bedff9;font-size:9px;letter-spacing:1.7px;font-weight:850;margin-bottom:7px}
+.owner-dialog-title {font-size:clamp(20px,2.5vw,26px);font-weight:850;letter-spacing:-.6px;line-height:1.2}
+.dialog-content {--background:#f8fbff}
+.dialog-body {padding:24px 28px 27px;color:#18355c;background:linear-gradient(180deg,#f8fbff,#fff 130px)}
+.dialog-body h2 {color:#173969;letter-spacing:-.6px;font-size:23px}
+.dialog-body h3 {color:#214b85}
+.dialog-body form > label,.form-grid > label {color:#35547b;font-weight:750;font-size:12px}
+.dialog-body label input,.dialog-body label textarea,.dialog-body label select {
+  width:100%;min-width:0;min-height:44px;padding:11px 13px;border:1px solid #d6e4f8;
+  border-radius:12px;background:#fff;color:#1b365e;outline:0;
+  box-shadow:0 3px 10px rgba(22,72,142,.03);
+  transition:border-color .18s,box-shadow .18s;
+}
+.dialog-body label textarea {min-height:84px;resize:vertical}
+.dialog-body label :is(input,select,textarea):focus {border-color:#3389e7;box-shadow:0 0 0 4px rgba(51,137,231,.12)}
+.form-grid {gap:2px 14px}
+.form-error {border-radius:12px;background:#fff2f3;border:1px solid #ffdee1;padding:12px;color:#af3549}
+.dialog-body .helper {background:#eef6ff;border-left:3px solid #277bda;border-radius:8px;padding:10px 12px;color:#527093}
+.dialog-body .details {display:grid;grid-template-columns:minmax(105px,36%) minmax(0,1fr);gap:9px 10px;margin:18px 0}
+.dialog-body .details dt,.dialog-body .details dd {
+  margin:0;padding:12px 13px;border:1px solid #e3ecfa;background:#fff;
+  border-radius:11px;min-width:0;overflow-wrap:anywhere;line-height:1.6;
+}
+.dialog-body .details dt {color:#617d9f;font-weight:750;background:#f2f7ff;font-size:11px}
+.dialog-body .details dd {font-weight:700;color:#1b3f73;font-size:12px}
+.dialog-body .pill {display:inline-flex;align-items:center;padding:8px 12px;border-radius:999px}
+.dialog-actions {
+  display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap;
+  padding:17px 0 0;margin-top:20px;border-top:1px solid #e2eafa;
+}
+.dialog-actions .button {min-width:120px;min-height:43px;padding:10px 16px;flex:0 0 auto}
+.dialog-actions .button.primary {background:linear-gradient(115deg,#1462cc,#238de5);box-shadow:0 8px 16px rgba(25,100,212,.15)}
+.dialog-actions .button.secondary {background:#fff;border:1px solid #d8e6fc;color:#1d5aab}
+.dialog-actions .button.danger-button {background:#fff2f2;border:1px solid #f3cbcb;color:#b53a4f}
+.record-modal :is(button,input,select,textarea):focus-visible {outline:3px solid #92c6ff;outline-offset:2px}
+@media(max-width:760px) {
+  .record-modal {--width:100%;--height:100%;--max-height:100%;--border-radius:0}
+  .record-modal::part(content) {border-radius:0}
+  .modal-toolbar {--min-height:92px}
+  .dialog-body {padding:20px 16px calc(26px + env(safe-area-inset-bottom,0px))}
+  .dialog-body .details {grid-template-columns:minmax(90px,36%) minmax(0,1fr);gap:7px}
+  .dialog-body .details dt,.dialog-body .details dd {padding:10px;font-size:11px}
+  .dialog-actions {position:relative;flex-wrap:wrap}
+  .dialog-actions .button {flex:1 1 130px;min-width:0;min-height:45px}
+}
+
+
+/* Monthly bill modal: independent light theme; no dark native radio alert. */
+:global(ion-modal.billing-workflow-modal) { --width:min(660px,calc(100% - 24px));--height:auto;--max-height:90%;--border-radius:23px;--background:#fff;--color:#19375e; }
+:global(ion-modal.billing-workflow-modal::part(content)) {background:#fff;border-radius:23px;box-shadow:0 25px 75px rgba(6,32,85,.24);overflow:hidden}
+.billing-modal-toolbar {--background:linear-gradient(114deg,#0c398a,#165fc8 66%,#279ce2);--color:#fff;--min-height:93px;--padding-start:22px;--padding-end:15px}
+.billing-modal-toolbar ion-button {--color:#fff}
+.billing-modal-heading {display:flex;flex-direction:column;gap:6px;margin-left:10px;color:#fff}
+.billing-eyebrow {font-size:10px;letter-spacing:1.1px;color:#cde3ff;font-weight:800}
+.billing-modal-heading strong {font-size:21px;font-weight:850;letter-spacing:-.5px}
+.billing-modal-content {--background:#fff;--color:#1c3b67;--padding-start:0;--padding-end:0}
+.billing-dialog-body {padding:22px 25px;color:#1d385d}
+.billing-progress {display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-bottom:20px}
+.billing-progress span {padding:11px 8px;text-align:center;background:#f0f4fc;color:#788eac;border:1px solid #e0eafa;border-radius:11px;font-size:11px;font-weight:800}
+.billing-progress .active {background:linear-gradient(105deg,#1a5bd1,#277fe6);border-color:#1a5bd1;color:#fff}
+.billing-progress .done {background:#e1f5ed;color:#087f65;border-color:#b9e5d5}
+.billing-lead h2 {font-size:18px;color:#183561;margin:0 0 6px}
+.billing-lead p {font-size:12px;color:#7187a5;margin:0 0 16px}
+.billing-lease-options {display:grid;gap:10px;max-height:290px;overflow-y:auto;padding:2px}
+.billing-lease-option {display:flex;align-items:center;gap:11px;padding:13px;border:1px solid #e0e8f8;border-radius:14px;background:#fff;cursor:pointer;transition:background .2s,border-color .2s,transform .2s}
+.billing-lease-option.selected {border-color:#4b8ce5;background:linear-gradient(120deg,#edf5ff,#fff);box-shadow:0 7px 16px rgba(25,87,183,.09)}
+.billing-lease-option:hover {border-color:#91b8f0;transform:translateY(-1px)}
+.billing-lease-option input {width:18px;height:18px;flex-shrink:0;accent-color:#1d62d6}
+.billing-lease-avatar {width:37px;height:37px;flex-shrink:0;display:grid;place-items:center;border-radius:12px;background:linear-gradient(125deg,#1d5fd2,#459eea);color:#fff;font-weight:850}
+.billing-lease-copy {min-width:0;flex:1;display:flex;flex-direction:column;gap:5px}
+.billing-lease-copy strong {font-size:13px;color:#183561}
+.billing-lease-copy small {font-size:11px;color:#7890ae;overflow-wrap:anywhere}
+.billing-lease-rent {font-size:12px;font-weight:850;color:#1459ba;white-space:nowrap;text-align:right}
+.billing-lease-rent small {display:block;margin-top:4px;color:#8fa0b8;font-size:10px;font-weight:500}
+.billing-selected-summary {display:flex;flex-direction:column;gap:5px;padding:15px;border-radius:13px;background:linear-gradient(115deg,#eaf3ff,#f4f9ff);border:1px solid #d9e8fc;margin-bottom:17px}
+.billing-selected-summary span {font-size:10px;color:#6a83a8;font-weight:750;text-transform:uppercase}
+.billing-selected-summary strong {font-size:14px;color:#163b75}
+.billing-selected-summary small {font-size:11px;color:#587cad}
+.billing-charge-form label {display:flex;flex-direction:column;gap:7px;font-weight:800;color:#3d587a;font-size:11px}
+.billing-charge-form input {width:100%;height:43px;border-radius:11px;border:1px solid #d7e3f5;background:#fff;color:#193c70;padding:9px 11px;font-size:13px;color-scheme:light}
+.billing-charge-form input:focus {outline:3px solid #c7dfff;border-color:#2576d9}
+.billing-charge-form label small {font-size:10px;color:#8799b2;font-weight:500}
+.billing-date-grid {display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.billing-subheading {font-size:12px;font-weight:850;color:#1d3f6d;margin:21px 0 11px}
+.billing-charges-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}
+.billing-total-box {display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:20px;padding:16px;border-radius:13px;background:linear-gradient(112deg,#103f92,#1d70d9);color:#fff}
+.billing-total-box span {font-size:12px;font-weight:700}
+.billing-total-box span small {display:block;margin-top:5px;color:#cfe3ff;font-size:10px}
+.billing-total-box strong {font-size:21px;color:#fff}
+.billing-error {background:#fff2f2;color:#ae283a;padding:10px 12px;border-radius:10px;font-size:12px;margin:12px 0 0}
+.billing-dialog-footer {display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:15px 25px 20px;border-top:1px solid #e4ebf7;background:#fbfdff}
+.billing-dialog-footer .button {min-width:120px;min-height:43px}
+@media(max-width:600px){:global(ion-modal.billing-workflow-modal){--width:calc(100% - 12px);--max-height:94%;--border-radius:16px}.billing-dialog-body{padding:17px}.billing-modal-toolbar{--min-height:79px}.billing-modal-heading strong{font-size:17px}.billing-lease-option{flex-wrap:wrap}.billing-lease-rent{margin-left:auto}.billing-date-grid{grid-template-columns:1fr}.billing-charges-grid{grid-template-columns:1fr 1fr}.billing-dialog-footer{padding:12px 15px calc(14px + env(safe-area-inset-bottom,0px))}.billing-dialog-footer .button{flex:1;min-width:0;padding-inline:8px;font-size:11px}}
+
+
+/* Owner-specific rental notifications and lease preparation */
+:global(ion-modal.owner-lease-modal) {--width:min(560px,calc(100% - 22px));--height:auto;--max-height:90%;--border-radius:23px;--box-shadow:0 30px 85px rgba(5,30,72,.25)}
+:global(ion-modal.owner-notice-modal) {--width:min(425px,calc(100% - 26px));--height:auto;--max-height:85%;--border-radius:23px;--box-shadow:0 28px 76px rgba(5,30,72,.22)}
+:global(ion-modal.owner-lease-modal::part(content)),:global(ion-modal.owner-notice-modal::part(content)){overflow-y:auto;background:#fff}
+.lease-modal-shell,.owner-notice-shell{color:#17335c;background:#fff;font-family:Inter,'Segoe UI',sans-serif}
+.lease-modal-hero,.owner-notice-hero{background:linear-gradient(120deg,#123d8f,#126dc6 62%,#12a4bd);color:#fff;position:relative;padding:26px 28px;display:flex;align-items:flex-start;justify-content:space-between;gap:15px;overflow:hidden}
+.lease-modal-hero::after,.owner-notice-hero::after{content:'';position:absolute;width:210px;height:210px;border:25px solid rgba(255,255,255,.1);border-radius:50%;right:-100px;bottom:-150px;pointer-events:none}
+.lease-modal-kicker,.owner-notice-kicker{font-size:10px;letter-spacing:1.4px;font-weight:850;color:#d7eeff}
+.lease-modal-hero h2{font-size:23px;color:#fff;margin:10px 0 7px;line-height:1.2}
+.lease-modal-hero p{color:#daedff;font-size:12px;line-height:1.6;margin:0;max-width:380px}
+.lease-close{background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.25);color:#fff;border-radius:11px;min-width:36px;min-height:36px;font-size:19px;cursor:pointer}
+.lease-modal-body{padding:23px 28px 26px;display:grid;gap:18px}
+.lease-summary{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.lease-summary>div{padding:13px;border:1px solid #dce8fb;border-radius:13px;background:linear-gradient(155deg,#fff,#f4f8ff)}
+.lease-summary>div:last-child{grid-column:1 / -1}
+.lease-summary span{display:block;font-size:9px;font-weight:800;letter-spacing:1px;color:#7b90ac;margin-bottom:7px}
+.lease-summary strong{font-size:13px;color:#193a71;overflow-wrap:anywhere}
+.lease-field{font-size:12px;font-weight:800;color:#274263;display:grid;gap:9px}
+.lease-money-input{display:flex;align-items:center;gap:10px;border-radius:13px;border:1px solid #cfdef4;padding:0 14px;min-height:48px;background:#fff}
+.lease-money-input:focus-within{outline:3px solid rgba(38,123,213,.16);border-color:#1878d6}
+.lease-money-input>span{font-weight:800;color:#1c64b2}
+.lease-money-input input{width:100%;min-width:0;border:0;background:transparent;outline:0;font-size:15px;padding:11px 0;color:#17335c}
+.lease-helper{display:flex;align-items:flex-start;gap:10px;font-size:12px;line-height:1.65;color:#5f7492;padding:12px;border-radius:12px;background:#f0f6ff;margin:0}
+.lease-helper ion-icon{font-size:17px;color:#2172cd;flex-shrink:0}
+.lease-error{margin:0;padding:10px 12px;border-radius:10px;background:#fff1f2;color:#9f3039;font-size:12px}
+.lease-modal-actions{display:flex;justify-content:flex-end;align-items:center;gap:10px;border-top:1px solid #e3ecf8;padding-top:16px}
+.lease-modal-actions .button{min-width:120px}
+.owner-notice-hero{display:flex;flex-direction:column;align-items:center;text-align:center;padding:24px 20px 18px;gap:14px}
+.owner-notice-hero.notice-error{background:linear-gradient(120deg,#aa3552,#e16a69)}
+.owner-notice-hero.notice-info{background:linear-gradient(120deg,#174994,#1595bd)}
+.notice-symbol{display:grid;place-items:center;width:55px;height:55px;border:1px solid rgba(255,255,255,.32);border-radius:18px;background:rgba(255,255,255,.15);font-size:30px}
+.owner-notice-body{text-align:center;padding:23px 26px 27px}
+.owner-notice-body h2{font-size:20px;color:#153763;margin:0 0 10px}
+.owner-notice-body p{color:#5e718c;font-size:13px;line-height:1.7;margin:0 0 22px;overflow-wrap:anywhere}
+.owner-notice-ok{width:100%;min-height:45px}
+@media(max-width:520px){.lease-modal-hero{padding:22px 18px}.lease-modal-body{padding:18px}.lease-summary{grid-template-columns:1fr}.lease-summary>div:last-child{grid-column:auto}.lease-modal-actions{flex-direction:column-reverse;align-items:stretch}.lease-modal-actions .button{width:100%}}
+
+/* Consistent Ionic confirmation dialogs, including approval and payment review. */
+:global(ion-alert.rentease-messagebox) {--background:#fff;--color:#1a365e;--backdrop-opacity:.52}
+:global(ion-alert.rentease-messagebox .alert-wrapper) {border-radius:22px;overflow:hidden;box-shadow:0 25px 72px rgba(11,38,85,.26);background:#fff;min-width:min(390px,calc(100vw - 28px));max-width:calc(100vw - 28px)}
+:global(ion-alert.rentease-messagebox .alert-head) {padding:22px 24px 14px;background:linear-gradient(115deg,#174caa,#187fc4)}
+:global(ion-alert.rentease-messagebox .alert-title) {color:#fff;font-size:19px;font-weight:800}
+:global(ion-alert.rentease-messagebox .alert-message) {padding:20px 24px 14px;color:#536c8b;font-size:13px;line-height:1.6;max-height:40vh}
+:global(ion-alert.rentease-messagebox .alert-input-group) {padding:12px 24px}
+:global(ion-alert.rentease-messagebox .alert-input) {border:1px solid #d5e3f7;border-radius:10px;padding:11px;color:#18375e;background:#fff}
+:global(ion-alert.rentease-messagebox .alert-button-group) {padding:10px 18px 18px;gap:8px;justify-content:flex-end}
+:global(ion-alert.rentease-messagebox .alert-button) {min-width:90px;min-height:40px;border-radius:10px;color:#185bb8;background:#eff5ff;font-weight:800;margin:0}
+:global(ion-alert.rentease-messagebox .alert-button:last-child) {background:linear-gradient(115deg,#1c5ed1,#178bd1);color:#fff}
+:global(ion-alert.rentease-messagebox .alert-button-inner) {justify-content:center}
 </style>

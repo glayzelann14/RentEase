@@ -5,7 +5,31 @@ const pool = require('../db');
 
 const router = express.Router();
 
-// Register a new tenant or property owner
+// ========================================
+// MIDDLEWARE: CHECK ADMIN ACCESS
+// ========================================
+function requireAdmin(req, res, next) {
+  if (!req.session || !req.session.user) {
+    return res.status(401).json({
+      success: false,
+      message: 'Please log in first.',
+    });
+  }
+
+  if (req.session.user.role !== 'admin') {
+    return res.status(403).json({
+      success: false,
+      message: 'Administrator access required.',
+    });
+  }
+
+  next();
+}
+
+// ========================================
+// SIGN UP: REGISTER TENANT OR OWNER
+// New accounts require admin approval.
+// ========================================
 router.post('/signup', async (req, res) => {
   try {
     const { name, email, password, role } = req.body;
@@ -41,7 +65,9 @@ router.post('/signup', async (req, res) => {
     const normalizedEmail = email.trim().toLowerCase();
 
     const existingUser = await pool.query(
-      'SELECT user_id FROM app_users WHERE email = $1',
+      `SELECT user_id
+       FROM app_users
+       WHERE email = $1`,
       [normalizedEmail]
     );
 
@@ -54,16 +80,25 @@ router.post('/signup', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 12);
 
-    await pool.query(
+    const result = await pool.query(
       `INSERT INTO app_users
-        (full_name, email, password_hash, role)
-       VALUES ($1, $2, $3, $4)`,
-      [name.trim(), normalizedEmail, passwordHash, role]
+        (full_name, email, password_hash, role, account_status)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING user_id, full_name, email, role, account_status`,
+      [
+        name.trim(),
+        normalizedEmail,
+        passwordHash,
+        role,
+        'pending',
+      ]
     );
 
     return res.status(201).json({
       success: true,
-      message: 'Account created successfully. You can now log in.',
+      message:
+        'Account created successfully. Please wait for admin approval before logging in.',
+      user: result.rows[0],
     });
   } catch (error) {
     if (error.code === '23505') {
@@ -82,7 +117,9 @@ router.post('/signup', async (req, res) => {
   }
 });
 
-// Log in an existing user
+// ========================================
+// LOG IN: ACTIVE ACCOUNTS ONLY
+// ========================================
 router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -100,7 +137,13 @@ router.post('/login', async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT user_id, full_name, email, password_hash, role, account_status
+      `SELECT
+         user_id,
+         full_name,
+         email,
+         password_hash,
+         role,
+         account_status
        FROM app_users
        WHERE email = $1`,
       [email.trim().toLowerCase()]
@@ -118,13 +161,38 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    if (user.account_status !== 'active') {
+    const accountStatus = String(
+      user.account_status || ''
+    ).toLowerCase();
+
+    if (accountStatus === 'pending') {
       return res.status(403).json({
         success: false,
-        message: 'This account is not active.',
+        status: 'pending',
+        message:
+          'Your account is waiting for admin approval. Please try again after your account has been approved.',
       });
     }
 
+    if (accountStatus === 'rejected') {
+      return res.status(403).json({
+        success: false,
+        status: 'rejected',
+        message:
+          'Your account registration was rejected. Please contact the administrator for assistance.',
+      });
+    }
+
+    if (accountStatus !== 'active') {
+      return res.status(403).json({
+        success: false,
+        status: accountStatus || 'inactive',
+        message:
+          'Your account is not active. Please contact the administrator.',
+      });
+    }
+
+    // Create a fresh session after successful authentication.
     req.session.regenerate((error) => {
       if (error) {
         console.error('Session creation failed:', error.message);
@@ -152,11 +220,6 @@ router.post('/login', async (req, res) => {
           });
         }
 
-        console.log('Login session saved:', {
-          sessionID: req.sessionID,
-          user: req.session.user,
-        });
-
         return res.json({
           success: true,
           message: 'Login successful.',
@@ -174,14 +237,11 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Check the current logged-in user
+// ========================================
+// GET CURRENT LOGGED-IN USER
+// ========================================
 router.get('/me', (req, res) => {
-  console.log('Checking session:', {
-    sessionID: req.sessionID,
-    user: req.session?.user,
-  });
-
-  if (!req.session?.user) {
+  if (!req.session || !req.session.user) {
     return res.status(401).json({
       success: false,
       message: 'You are not logged in.',
@@ -194,9 +254,18 @@ router.get('/me', (req, res) => {
   });
 });
 
-// Log out the current user
-router.post('/logout', (req, res, next) => {
+// ========================================
+// LOG OUT
+// ========================================
+router.post('/logout', (req, res) => {
   if (!req.session) {
+    res.clearCookie('rentease.sid', {
+      httpOnly: true,
+      secure: false,
+      sameSite: 'lax',
+      path: '/',
+    });
+
     return res.json({
       success: true,
       message: 'Logged out successfully.',
@@ -205,13 +274,19 @@ router.post('/logout', (req, res, next) => {
 
   req.session.destroy((error) => {
     if (error) {
-      return next(error);
+      console.error('Logout failed:', error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to log out.',
+      });
     }
 
     res.clearCookie('rentease.sid', {
       httpOnly: true,
       secure: false,
       sameSite: 'lax',
+      path: '/',
     });
 
     return res.json({
@@ -220,5 +295,146 @@ router.post('/logout', (req, res, next) => {
     });
   });
 });
+
+// ========================================
+// ADMIN: GET REGISTERED TENANTS AND OWNERS
+// ========================================
+router.get('/admin/users', requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         user_id,
+         full_name,
+         email,
+         role,
+         account_status
+       FROM app_users
+       WHERE role IN ('tenant', 'owner')
+       ORDER BY user_id DESC`
+    );
+
+    return res.json({
+      success: true,
+      users: result.rows,
+    });
+  } catch (error) {
+    console.error('Loading admin users failed:', error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: 'Unable to load registered users.',
+    });
+  }
+});
+
+// ========================================
+// ADMIN: APPROVE ACCOUNT
+// Sets account_status to active.
+// ========================================
+router.patch(
+  '/admin/users/:id/approve',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!/^\d+$/.test(id)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid user ID.',
+        });
+      }
+
+      const result = await pool.query(
+        `UPDATE app_users
+         SET account_status = 'active'
+         WHERE user_id = $1
+           AND role IN ('tenant', 'owner')
+         RETURNING
+           user_id,
+           full_name,
+           email,
+           role,
+           account_status`,
+        [Number(id)]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'User not found.',
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Account approved successfully.',
+        user: result.rows[0],
+      });
+    } catch (error) {
+      console.error('Approving user failed:', error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to approve this account.',
+      });
+    }
+  }
+);
+
+// ========================================
+// ADMIN: REJECT ACCOUNT
+// Sets account_status to rejected.
+// ========================================
+router.patch(
+  '/admin/users/:id/reject',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!/^\d+$/.test(id)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid user ID.',
+        });
+      }
+
+      const result = await pool.query(
+        `UPDATE app_users
+         SET account_status = 'rejected'
+         WHERE user_id = $1
+           AND role IN ('tenant', 'owner')
+         RETURNING
+           user_id,
+           full_name,
+           email,
+           role,
+           account_status`,
+        [Number(id)]
+      );
+
+      if (result.rowCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: 'User not found.',
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: 'Account rejected successfully.',
+        user: result.rows[0],
+      });
+    } catch (error) {
+      console.error('Rejecting user failed:', error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to reject this account.',
+      });
+    }
+  }
+);
 
 module.exports = router;

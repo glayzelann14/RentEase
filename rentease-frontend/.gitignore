@@ -1,1 +1,38 @@
-node_modules
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+
+# Build files
+dist/
+build/
+coverage/
+.vite/
+
+# Capacitor / Android local files
+android/.gradle/
+android/local.properties
+android/**/build/
+
+# Logs
+*.log
+npm-debug.log*
+logs/
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local database backups
+*.dump
+*.backup
+*.sql.gz
