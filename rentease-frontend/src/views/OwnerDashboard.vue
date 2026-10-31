@@ -1,9 +1,14 @@
 <script setup lang="ts">
+import { getMyProfile, saveMyProfile } from '@/services/profile';
 import { computed, reactive, ref, watch, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { logout as logoutUser } from '@/services/auth';
 import { restoreSession } from '@/services/auth';
 import { listProperties, listPropertyUnits, createProperty, createUnit, updateProperty, updateUnit } from '@/services/properties';
+import { confirmUnitTurnover } from '@/services/turnover';
+import { listOwnerDeposits, decideDepositPayment, type SecurityDepositPayment } from '@/services/deposits';
+import { listOwnerSettlements, createDepositSettlement, addDepositDeduction, deleteDepositDeduction, finalizeDepositSettlement, recordDepositRefund, decideDepositRefund, type DepositSettlement } from '@/services/depositSettlements';
+import { printDepositSettlement } from '@/services/printDepositSettlement';
 import { listOwnerApplications, reviewRentalApplication, type RentalApplication } from '@/services/applications';
 import { listOwnerLeases, prepareLease, finishLease, type RentalLease } from '@/services/leases';
 import { listOwnerBills, listOwnerPayments, createBill, decidePayment, type RentalBill, type RentalPayment } from '@/services/billing';
@@ -25,6 +30,7 @@ import {
   businessOutline,
   documentTextOutline,
   timeOutline,
+  informationCircleOutline,
   cardOutline,
   constructOutline,
   personOutline,
@@ -138,6 +144,11 @@ const reviewingApplication = ref(false);
 const leasesLoading = ref(false);
 const leasesError = ref('');
 const savingLease = ref(false);
+const releasingUnitId = ref<number | null>(null);
+const depositRecords = ref<SecurityDepositPayment[]>([]);
+const depositsLoading = ref(false);
+const depositsSaving = ref<number | null>(null);
+const depositsError = ref('');
 const financeLoading=ref(false);
 const financeSaving=ref(false);
 const financeError=ref('');
@@ -495,9 +506,14 @@ function closeLeasePreparation() {
 async function submitLeasePreparation() {
   const app = leaseDialogApplication.value;
   if (!app || savingLease.value) return;
-  const amount = Number(leaseDeposit.value);
-  if (!leaseDeposit.value.trim() || !Number.isFinite(amount) || amount < 0) {
-    leaseDialogError.value = 'Enter a valid security deposit of ₱0 or more.'; return;
+  // A Vue number input can update a v-model with a number even when its
+  // initial value was a string. Normalize before using string methods.
+  const depositText = String(leaseDeposit.value ?? '').trim();
+  const amount = Number(depositText);
+  if (!depositText || !/^\d+(?:\.\d{1,2})?$/.test(depositText) ||
+      !Number.isFinite(amount) || amount < 0 || amount > 100000000) {
+    leaseDialogError.value = 'Enter an amount from ₱0 to ₱100,000,000, with no more than 2 decimal places.';
+    return;
   }
   savingLease.value = true;
   leaseDialogError.value = '';
@@ -532,7 +548,10 @@ function issueBill() {
   if (!active.length) { notify('No active lease is available for billing.'); return; }
   const today = new Date();
   const month = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
-  Object.assign(billingForm, { leaseId: active[0].id, month, due: month, water: '0', electricity: '0', other: '0' });
+  // Default to a future payment deadline; the billing period may be earlier than today.
+  const dueDate = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 7);
+  const suggestedDue = `${dueDate.getFullYear()}-${String(dueDate.getMonth() + 1).padStart(2, '0')}-${String(dueDate.getDate()).padStart(2, '0')}`;
+  Object.assign(billingForm, { leaseId: active[0].id, month, due: suggestedDue, water: '0', electricity: '0', other: '0' });
   billingError.value = '';
   billingStep.value = 1;
   billingModalOpen.value = true;
@@ -546,6 +565,10 @@ async function submitMonthlyBill() {
   if (financeSaving.value) return;
   const lease = chosenBillingLease.value;
   if (!lease) { billingStep.value = 1; billingError.value = 'Choose an active lease.'; return; }
+  if (state.bills.some(b => b.leaseId === lease.id && b.period === billingForm.month.slice(0, 7))) {
+    billingError.value = 'A monthly bill already exists for this rental and billing period. Choose another month or review the existing statement.';
+    return;
+  }
   if (!/^\d{4}-\d{2}-01$/.test(billingForm.month)) { billingError.value = 'Billing month must be a valid date on day 01.'; return; }
   const billDate = new Date(`${billingForm.month}T12:00:00`);
   const dueDate = new Date(`${billingForm.due}T12:00:00`);
@@ -553,17 +576,31 @@ async function submitMonthlyBill() {
       Number.isNaN(dueDate.getTime()) || dueDate.toISOString().slice(0,10) !== billingForm.due) {
     billingError.value = 'Enter valid billing and due dates.'; return;
   }
-  for (const label of ['water','electricity','other'] as const) {
-    const value = Number(billingForm[label]);
-    if (!billingForm[label].trim() || !Number.isFinite(value) || value < 0) {
-      billingError.value = 'Charges must be valid, nonnegative amounts.'; return;
+  // Vue automatically converts values from <input type="number"> to numbers.
+  // Normalize each charge before validation; calling .trim() on a number crashes.
+  const validatedCharges: Record<'water' | 'electricity' | 'other', number> = {
+    water: 0,
+    electricity: 0,
+    other: 0,
+  };
+  for (const label of ['water', 'electricity', 'other'] as const) {
+    const raw = String(billingForm[label] ?? '').trim();
+    const value = Number(raw);
+    if (!raw || !/^\d+(?:\.\d{1,2})?$/.test(raw) || !Number.isFinite(value) || value < 0) {
+      billingError.value = `Enter a valid ${label} charge of ₱0 or more (up to two decimal places).`;
+      return;
     }
+    validatedCharges[label] = value;
+  }
+  if (billingForm.due < billingForm.month) {
+    billingError.value = 'Payment due date must not be earlier than the billing period.';
+    return;
   }
   billingError.value = '';
   financeSaving.value = true;
   try {
     await createBill({ lease_id: lease.id, billing_period: billingForm.month, due_date: billingForm.due,
-      water_charge: Number(billingForm.water), electricity_charge: Number(billingForm.electricity), other_charges: Number(billingForm.other) });
+      water_charge: validatedCharges.water, electricity_charge: validatedCharges.electricity, other_charges: validatedCharges.other });
     billingModalOpen.value = false;
     await refreshFinances();
     notify('Monthly bill created. The tenant can now view the statement.');
@@ -586,11 +623,14 @@ onMounted(async () => {
     }
     state.profile.name = user.name;
     state.profile.email = user.email;
+    try { const saved = await getMyProfile(); state.profile.name = saved.name; state.profile.mobile = saved.mobile; state.profile.avatar = saved.avatar_url; } catch(error) { console.warn('Profile loading failed:',error); }
     await refreshRentalCatalog();
     await refreshOwnerApplications();
     await refreshOwnerLeases();
     await refreshFinances();
     await refreshOwnerMaintenance();
+    await refreshSettlements();
+    await refreshOwnerDeposits();
   } catch (error) {
     console.error('Failed to restore owner session:', error);
     message.value = 'Unable to verify your session.';
@@ -603,6 +643,108 @@ const search = ref('');
 const statusFilter = ref('ALL');
 const propertyFilter = ref('ALL');
 const returnToOwnerProfile = ref(false);
+async function refreshOwnerDeposits() {
+  if (depositsLoading.value) return;
+  depositsLoading.value = true;
+  depositsError.value = '';
+  try { depositRecords.value = await listOwnerDeposits(); }
+  catch (error: any) { depositsError.value = error?.response?.data?.message || error?.message || 'Could not load security deposit records.'; }
+  finally { depositsLoading.value = false; }
+}
+
+function ownerDepositVerified(leaseId: number): number {
+  return depositRecords.value.filter(x => Number(x.lease_id) === leaseId && x.status === 'verified').reduce((sum,x) => sum + Number(x.amount), 0);
+}
+function ownerDepositPending(leaseId: number): number {
+  return depositRecords.value.filter(x => Number(x.lease_id) === leaseId && x.status === 'pending_verification').reduce((sum,x) => sum + Number(x.amount), 0);
+}
+const ownerDepositPendingCount = computed(() => depositRecords.value.filter(x => x.status === 'pending_verification').length);
+
+const settlements = ref<DepositSettlement[]>([]);
+const settlementsLoading = ref(false);
+const settlementBusy = ref(false);
+const settlementError = ref('');
+const eligibleSettlements = computed(() => state.leases.filter(l => l.status === 'COMPLETED' && ownerDepositVerified(l.id) > 0 && !settlements.value.some(s => Number(s.lease_id) === l.id)));
+async function refreshSettlements() {
+  if (settlementsLoading.value) return;
+  settlementsLoading.value = true; settlementError.value = '';
+  try { settlements.value = await listOwnerSettlements(); }
+  catch (e: any) { settlementError.value = e?.response?.data?.message || e?.message || 'Unable to load settlements.'; }
+  finally { settlementsLoading.value = false; }
+}
+async function settlementAction(task: () => Promise<unknown>, success: string) {
+  if (settlementBusy.value) return;
+  settlementBusy.value = true;
+  try { await task(); await Promise.all([refreshSettlements(), refreshOwnerDeposits()]); notify(success); }
+  catch (e: any) { notify(e?.response?.data?.message || e?.message || 'Settlement action failed.'); }
+  finally { settlementBusy.value = false; }
+}
+async function createSettlementForLease(l: Lease) {
+  if (!await systemConfirm(`Create a security deposit settlement for Lease #${l.id}? This is only allowed after the lease has been completed.`, 'Create deposit settlement', 'Create Draft')) return;
+  await settlementAction(() => createDepositSettlement(l.id), 'Settlement draft created.');
+}
+async function addSettlementDeduction(s: DepositSettlement) {
+  const description = await systemPrompt('Describe the justified deduction (at least 5 characters):');
+  if (description === null) return;
+  if (description.trim().length < 5) { notify('Provide a clear deduction reason.'); return; }
+  const raw = await systemPrompt('Deduction amount in PHP (e.g., 250.00):');
+  if (raw === null) return;
+  const amount = Number(raw);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw.trim()) || !Number.isFinite(amount) || amount <= 0 || amount > Number(s.summary.verified_deposit) - Number(s.summary.total_deductions)) { notify('Invalid deduction amount.'); return; }
+  const evidence = await systemPrompt('Optional evidence or inspection note (Cancel to leave blank):');
+  await settlementAction(() => addDepositDeduction(Number(s.settlement_id), { description: description.trim(), amount, evidence_note: (evidence || '').trim() }), 'Deduction added.');
+}
+async function removeSettlementDeduction(s: DepositSettlement, deductionId: number) {
+  if (!await systemConfirm('Remove this draft deduction?', 'Remove deduction', 'Remove')) return;
+  await settlementAction(() => deleteDepositDeduction(Number(s.settlement_id), deductionId), 'Deduction removed.');
+}
+async function finalizeSettlementUI(s: DepositSettlement) {
+  if (!await systemConfirm(`Finalize this settlement? Deductions: ${peso(Number(s.summary.total_deductions))}. Refundable: ${peso(Number(s.summary.refundable_amount))}. You will no longer be able to change deductions.`, 'Finalize settlement', 'Finalize')) return;
+  await settlementAction(() => finalizeDepositSettlement(Number(s.settlement_id)), 'Settlement finalized.');
+}
+async function recordRefundUI(s: DepositSettlement) {
+  const remaining = Number(s.summary.remaining_refund) - Number(s.summary.pending_refunds);
+  if (remaining <= 0) { notify('No refundable amount is available to record.'); return; }
+  const raw = await systemPrompt(`Refund amount in PHP (available: ${peso(remaining)}):`);
+  if (raw === null) return;
+  const amount = Number(raw);
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw.trim()) || !Number.isFinite(amount) || amount <= 0 || amount > remaining) { notify('Invalid refund amount.'); return; }
+  const methodInput = await systemPrompt('Refund method: cash, gcash, bank_transfer, or other');
+  if (methodInput === null) return;
+  const method = methodInput.trim().toLowerCase();
+  if (!['cash', 'gcash', 'bank_transfer', 'other'].includes(method)) { notify('Invalid refund method.'); return; }
+  const refNo = await systemPrompt('Transaction reference (required except for cash):');
+  if (refNo === null || (method !== 'cash' && !refNo.trim())) { notify('A reference is required for non-cash refunds.'); return; }
+  if (!await systemConfirm(`Record ${peso(amount)} as a pending ${method} refund? Only confirm after the tenant has actually received the payment.`, 'Record pending refund', 'Record')) return;
+  await settlementAction(() => recordDepositRefund(Number(s.settlement_id), { amount, payment_method: method as 'cash' | 'gcash' | 'bank_transfer' | 'other', reference_number: refNo.trim() }), 'Pending refund recorded.');
+}
+async function reviewRefundUI(s: DepositSettlement, refundId: number, decision: 'confirmed' | 'cancelled') {
+  if (!await systemConfirm(decision === 'confirmed' ? 'Confirm only if the refund was actually paid to the tenant.' : 'Cancel this pending refund record?', decision === 'confirmed' ? 'Confirm payout' : 'Cancel pending refund', decision === 'confirmed' ? 'Confirm Paid' : 'Cancel')) return;
+  await settlementAction(() => decideDepositRefund(Number(s.settlement_id), refundId, decision), decision === 'confirmed' ? 'Refund payout confirmed.' : 'Refund cancelled.');
+}
+
+async function reviewDeposit(record: SecurityDepositPayment, decision: 'verified' | 'rejected') {
+  if (depositsSaving.value !== null || record.status !== 'pending_verification') return;
+  let reason = '';
+  if (decision === 'rejected') {
+    const entered = await systemPrompt(`Enter the reason for rejecting ${peso(Number(record.amount))} from ${record.tenant_name}.`);
+    if (entered === null) return;
+    reason = entered.trim();
+    if (!reason) { notify('A rejection reason is required.'); return; }
+  } else {
+    const confirmed = await systemConfirm(`Verify the actual receipt of ${peso(Number(record.amount))} for ${record.tenant_name} (Lease #${record.lease_id})? A submitted reference is not proof by itself.`, 'Verify security deposit', 'Verify Deposit');
+    if (!confirmed) return;
+  }
+  depositsSaving.value = Number(record.deposit_payment_id);
+  try {
+    await decideDepositPayment(Number(record.deposit_payment_id), decision, reason);
+    await refreshOwnerDeposits();
+    notify(decision === 'verified' ? 'Security deposit verified and recorded.' : 'Security deposit submission rejected.');
+  } catch (error: any) {
+    notify('Deposit review failed: ' + (error?.response?.data?.message || error?.message || 'Unknown error'));
+  } finally { depositsSaving.value = null; }
+}
+
 const menu = [
   { id: 'overview', label: 'Dashboard Overview', icon: gridOutline },
   { id: 'properties', label: 'Properties & Units', icon: businessOutline },
@@ -610,6 +752,7 @@ const menu = [
   { id: 'history', label: 'History', icon: timeOutline },
   { id: 'payments', label: 'Payments', icon: cardOutline },
   { id: 'bills', label: 'Bills & Balances', icon: documentTextOutline },
+  { id: 'deposits', label: 'Security Deposits', icon: cardOutline },
   { id: 'leases', label: 'Lease Management', icon: documentTextOutline },
   { id: 'maintenance', label: 'Maintenance Requests', icon: constructOutline },
   { id: 'profile', label: 'Owner Profile', icon: personOutline },
@@ -621,6 +764,7 @@ const titles: Record<string, string> = {
   history: 'History',
   payments: 'Payment Review',
   bills: 'Bills & Balances',
+  deposits: 'Security Deposit Management',
   leases: 'Lease Management',
   maintenance: 'Maintenance Requests',
   profile: 'Owner Profile',
@@ -632,6 +776,7 @@ const subtitles: Record<string, string> = {
   history: 'Explore previously approved and rejected applications.',
   payments: 'Review submitted payments and verification outcomes.',
   bills: 'Monitor outstanding balances and upcoming due dates.',
+  deposits: 'Verify security deposit collections separately from monthly rent.',
   leases: 'Review rental agreements and lease expirations.',
   maintenance: 'Track reported issues from submission to resolution.',
   profile: 'Keep your contact information up to date.',
@@ -649,6 +794,8 @@ function navigate(target: string) {
   if (target === 'pending' || target === 'history' || target === 'overview') void refreshOwnerApplications();
   if (target === 'leases' || target === 'overview') void refreshOwnerLeases();
   if (target === 'bills' || target === 'payments' || target === 'overview') void refreshFinances();
+  if (target === 'deposits' || target === 'overview') void refreshOwnerDeposits();
+  if (target === 'deposits') { void refreshOwnerLeases(); void refreshSettlements(); }
   if (target === 'maintenance' || target === 'overview') void refreshOwnerMaintenance();
 }
 function viewProfileUnits(propertyId: number) {
@@ -1342,26 +1489,19 @@ function uploadAvatar(event: Event) {
   };
   reader.readAsDataURL(file);
 }
-function saveProfile() {
-  if (
-    !form.name.trim() ||
-    !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim()) ||
-    !/^(09\d{9}|\+639\d{9})$/.test(form.mobile.trim())
-  ) {
-    formError.value = 'Enter your name, a valid email, and a Philippine mobile number.';
+async function saveProfile() {
+  if (!form.name.trim() || !/^(09\d{9}|\+639\d{9})$/.test(form.mobile.trim())) {
+    formError.value = 'Enter your name and a valid Philippine mobile number.';
     return;
   }
-  Object.assign(state.profile, {
-    name: form.name.trim(),
-    email: form.email.trim(),
-    mobile: form.mobile.trim(),
-    avatar: form.avatar,
-  });
-  localStorage.setItem('userName', form.name.trim());
-  localStorage.setItem('userEmail', form.email.trim());
-  activity('Owner profile was updated.');
-  closeDialog();
-  notify('Profile saved successfully.');
+  try {
+    const saved = await saveMyProfile(form.name.trim(), form.mobile.trim(), form.avatar);
+    Object.assign(state.profile, { name: saved.name, email: saved.email, mobile: saved.mobile, avatar: saved.avatar_url || form.avatar });
+    closeDialog();
+    notify('Your profile has been updated successfully.');
+  } catch(error: any) {
+    formError.value = error?.response?.data?.message || error?.message || 'Unable to save profile.';
+  }
 }
 async function reviewApplication(app: Application, approved: boolean) {
   if (reviewingApplication.value || app.status !== 'PENDING') return;
@@ -1416,12 +1556,47 @@ async function updateMaintenance(){
 
 async function completeLease(lease: Lease) {
   if (lease.status !== 'ACTIVE' || savingLease.value) return;
-  const ok = await systemConfirm(`Complete ${lease.tenant}'s lease? This changes the database record and may reopen the unit for new applications.`, 'Complete lease','Complete');
+  if (lease.end >= dateOffset(0)) {
+    notify(`This lease ends on ${readableDate(lease.end)}. It cannot be completed before its end date. Early termination requires a separate authorized process.`);
+    return;
+  }
+  const ok = await systemConfirm(
+    `Complete ${lease.tenant}'s lease for ${unitLabel(lease.unitId)}? The lease will be marked completed and the unit moved to MAINTENANCE for turnover inspection. It will NOT be available to new tenants until you confirm turnover. Existing bills and payments are retained.`,
+    'Complete ended lease',
+    'Complete Lease',
+  );
   if (!ok) return;
   savingLease.value = true;
-  try { await finishLease(lease.id);await Promise.all([refreshOwnerLeases(),refreshRentalCatalog()]);closeDialog();notify('Lease marked as completed. The rental unit status has been updated.'); }
+  try { await finishLease(lease.id);await Promise.all([refreshOwnerLeases(),refreshRentalCatalog()]);closeDialog();notify('Lease completed. The unit is now in maintenance pending turnover confirmation.'); }
   catch(error:any){notify('Could not complete lease: '+(error?.response?.data?.message || error?.message || 'Unknown error'));}
   finally{savingLease.value=false;}
+}
+
+// A completed lease leaves its unit unavailable until the owner explicitly confirms turnover.
+function canConfirmTurnover(unit: Unit): boolean {
+  return unit.status === 'MAINTENANCE' &&
+    state.leases.some(lease => lease.unitId === unit.id && lease.status === 'COMPLETED') &&
+    !state.leases.some(lease => lease.unitId === unit.id && ['ACTIVE', 'PENDING'].includes(lease.status));
+}
+
+async function confirmTurnover(unit: Unit) {
+  if (releasingUnitId.value !== null || !canConfirmTurnover(unit)) return;
+  const ok = await systemConfirm(
+    `Confirm that ${unitLabel(unit.id)} at ${propertyName(unit.propertyId)} has been vacated and inspected, and is ready for new tenants? This will change the unit to AVAILABLE. This does not settle bills or refund security deposits.`,
+    'Confirm unit turnover',
+    'Make Unit Available',
+  );
+  if (!ok) return;
+  releasingUnitId.value = unit.id;
+  try {
+    await confirmUnitTurnover(unit.propertyId, unit.id);
+    await Promise.all([refreshRentalCatalog(), refreshOwnerLeases()]);
+    notify(`${unitLabel(unit.id)} is now available for new rental applications.`);
+  } catch (error: any) {
+    notify('Turnover could not be confirmed: ' + (error?.response?.data?.message || error?.message || 'Unknown error'));
+  } finally {
+    releasingUnitId.value = null;
+  }
 }
 
 async function resetDemo() {
@@ -2004,6 +2179,15 @@ async function logout() {
                         >
                           Edit unit
                         </button>
+                        <button
+                          v-if="canConfirmTurnover(unit)"
+                          type="button"
+                          class="text-button"
+                          :disabled="releasingUnitId !== null"
+                          @click="confirmTurnover(unit)"
+                        >
+                          {{ releasingUnitId === unit.id ? 'Releasing...' : 'Confirm Turnover' }}
+                        </button>
                       </td>
                     </tr>
                     <tr v-if="!filteredUnits.length">
@@ -2210,6 +2394,46 @@ async function logout() {
               </table>
             </div>
           </section>
+          <section v-if="section === 'deposits'" class="panel" aria-label="Security Deposit Management">
+            <div class="panel-heading"><div><h2>Security Deposit Management</h2><p>Deposit collections are separate from rental bills. Payments require owner verification.</p></div><button type="button" class="button secondary" :disabled="depositsLoading" @click="refreshOwnerDeposits">{{ depositsLoading ? 'Loading...' : 'Refresh Deposits' }}</button></div>
+            <p v-if="depositsError" class="notice" role="alert">{{ depositsError }}</p>
+            <div class="deposit-highlights">
+              <article><span>Pending verification</span><strong>{{ ownerDepositPendingCount }}</strong></article>
+              <article><span>Verified deposit collections</span><strong>{{ peso(depositRecords.filter(d => d.status === 'verified').reduce((s,d) => s + Number(d.amount), 0)) }}</strong></article>
+              <article><span>Submissions on record</span><strong>{{ depositRecords.length }}</strong></article>
+            </div>
+            <div class="table-wrap"><table><thead><tr><th>Tenant / Lease</th><th>Rental unit</th><th>Required</th><th>Verified / Pending</th><th>Submission</th><th>Reference</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+              <tr v-for="deposit in depositRecords" :key="deposit.deposit_payment_id">
+                <td><strong>{{ deposit.tenant_name }}</strong><br />Lease #{{ deposit.lease_id }}</td>
+                <td>{{ deposit.property_name }} — Unit {{ deposit.unit_number }}</td>
+                <td>{{ peso(Number(deposit.security_deposit)) }}</td>
+                <td>{{ peso(ownerDepositVerified(Number(deposit.lease_id))) }} verified<br />{{ peso(ownerDepositPending(Number(deposit.lease_id))) }} pending</td>
+                <td>{{ peso(Number(deposit.amount)) }}<br />{{ String(deposit.submitted_at).slice(0, 10) }}</td>
+                <td>{{ deposit.payment_method }}<br />{{ deposit.reference_number || 'Cash payment' }}</td>
+                <td><span class="pill" :class="badgeClass(deposit.status === 'verified' ? 'VERIFIED' : deposit.status === 'rejected' ? 'REJECTED' : 'PENDING')">{{ deposit.status.replaceAll('_', ' ').toUpperCase() }}</span><small v-if="deposit.rejection_reason" class="deposit-reason">{{ deposit.rejection_reason }}</small></td>
+                <td><div v-if="deposit.status === 'pending_verification'" class="deposit-actions"><button type="button" class="button primary" :disabled="depositsSaving !== null" @click="reviewDeposit(deposit, 'verified')">Verify</button><button type="button" class="button secondary" :disabled="depositsSaving !== null" @click="reviewDeposit(deposit, 'rejected')">Reject</button></div><span v-else>Reviewed</span></td>
+              </tr>
+              <tr v-if="!depositRecords.length"><td colspan="8" class="empty">No security deposit submissions yet. An agreed deposit amount is not proof that it was paid.</td></tr>
+            </tbody></table></div>
+            <p class="helper">Collection requires owner verification; final settlement and refunds are tracked separately below.</p>
+            <div class="panel-heading" style="margin-top:26px"><div><h2>Deposit Settlements & Refunds</h2><p>Only completed leases with verified deposit collections can be settled.</p></div><button class="button secondary" type="button" :disabled="settlementsLoading" @click="refreshSettlements">{{ settlementsLoading ? 'Loading...' : 'Refresh Settlements' }}</button></div>
+            <p v-if="settlementError" class="notice" role="alert">{{ settlementError }}</p>
+            <div v-if="eligibleSettlements.length" class="table-wrap"><table><thead><tr><th>Eligible lease</th><th>Tenant</th><th>Verified deposit</th><th>Action</th></tr></thead><tbody><tr v-for="l in eligibleSettlements" :key="l.id"><td>Lease #{{ l.id }}</td><td>{{ l.tenant }}</td><td>{{ peso(ownerDepositVerified(l.id)) }}</td><td><button type="button" class="button primary" :disabled="settlementBusy" @click="createSettlementForLease(l)">Create Settlement Draft</button></td></tr></tbody></table></div>
+            <p v-else class="helper">No newly eligible leases. Active leases cannot be finalized for deposit settlement.</p>
+            <article v-for="s in settlements" :key="s.settlement_id" style="padding:18px 0; border-top:1px solid #d9e5f4">
+              <div class="panel-heading"><div><h3>Settlement #{{ s.settlement_id }} — {{ s.tenant_name }}</h3><p>{{ s.property_name }} · Unit {{ s.unit_number }} · Lease #{{ s.lease_id }}</p></div><span class="pill" :class="badgeClass(s.status === 'settled' ? 'COMPLETED' : s.status === 'finalized' ? 'APPROVED' : 'PENDING')">{{ s.status.toUpperCase() }}</span></div>
+              <div v-if="s.status === 'finalized' || s.status === 'settled'" class="deposit-actions" style="margin:10px 0"><button type="button" class="button secondary" @click="printDepositSettlement(s)">Print Settlement Statement</button></div>
+              <div class="deposit-highlights"><article><span>Verified deposit</span><strong>{{ peso(Number(s.summary.verified_deposit)) }}</strong></article><article><span>Deductions</span><strong>{{ peso(Number(s.summary.total_deductions)) }}</strong></article><article><span>Refundable</span><strong>{{ peso(Number(s.summary.refundable_amount)) }}</strong></article><article><span>Remaining refund</span><strong>{{ peso(Number(s.summary.remaining_refund)) }}</strong></article></div>
+              <h4>Itemized Deductions</h4>
+              <div class="table-wrap"><table><thead><tr><th>Reason</th><th>Amount</th><th>Evidence note</th><th>Action</th></tr></thead><tbody><tr v-for="d in s.deductions" :key="d.deduction_id"><td>{{ d.description }}</td><td>{{ peso(Number(d.amount)) }}</td><td>{{ d.evidence_note || '—' }}</td><td><button v-if="s.status === 'draft'" class="button secondary" type="button" :disabled="settlementBusy" @click="removeSettlementDeduction(s, d.deduction_id)">Remove</button></td></tr><tr v-if="!s.deductions.length"><td colspan="4">No deductions recorded.</td></tr></tbody></table></div>
+              <div v-if="s.status === 'draft'" class="deposit-actions" style="margin:14px 0"><button type="button" class="button secondary" :disabled="settlementBusy" @click="addSettlementDeduction(s)">Add Deduction</button><button type="button" class="button primary" :disabled="settlementBusy" @click="finalizeSettlementUI(s)">Finalize Settlement</button></div>
+              <h4>Refund Transactions</h4>
+              <p class="helper">Confirmed: {{ peso(Number(s.summary.confirmed_refunds)) }} · Pending: {{ peso(Number(s.summary.pending_refunds)) }}</p>
+              <div class="table-wrap"><table><thead><tr><th>Amount</th><th>Method</th><th>Reference</th><th>Status</th><th>Action</th></tr></thead><tbody><tr v-for="r in s.refunds" :key="r.refund_id"><td>{{ peso(Number(r.amount)) }}</td><td>{{ r.payment_method }}</td><td>{{ r.reference_number || 'Cash' }}</td><td>{{ r.status }}</td><td><div v-if="r.status === 'pending'" class="deposit-actions"><button type="button" class="button primary" :disabled="settlementBusy" @click="reviewRefundUI(s, r.refund_id, 'confirmed')">Confirm Paid</button><button type="button" class="button secondary" :disabled="settlementBusy" @click="reviewRefundUI(s, r.refund_id, 'cancelled')">Cancel</button></div></td></tr><tr v-if="!s.refunds.length"><td colspan="5">No refund transactions recorded.</td></tr></tbody></table></div>
+              <button v-if="s.status === 'finalized' && Number(s.summary.remaining_refund) > Number(s.summary.pending_refunds)" type="button" class="button primary" style="margin-top:12px" :disabled="settlementBusy" @click="recordRefundUI(s)">Record Refund</button>
+            </article>
+            <p v-if="!settlements.length" class="helper">No deposit settlements yet.</p>
+          </section>
           <section v-if="section === 'leases'" class="panel">
             <div class="panel-heading">
               <div>
@@ -2404,10 +2628,16 @@ async function logout() {
             <div><span>RENTAL UNIT</span><strong>{{ unitProperty(leaseDialogApplication.unitId) }} · {{ unitLabel(leaseDialogApplication.unitId) }}</strong></div>
             <div><span>LEASE DURATION</span><strong>{{ leaseDialogApplication.duration }} months</strong></div>
           </div>
+          <div class="lease-deposit-explainer" id="lease-deposit-explainer">
+            <div class="deposit-explainer-heading"><IonIcon :icon="informationCircleOutline" /><strong>What is a security deposit?</strong></div>
+            <p>A security deposit is an amount held as protection against unpaid obligations or damage beyond normal wear and tear, subject to the rental agreement. Any remaining refundable balance is settled at the end of the tenancy.</p>
+            <p><strong>This is not monthly rent.</strong> Entering an amount here records the agreed deposit in the lease; it does not collect or confirm payment. Enter <strong>₱0</strong> only when no security deposit is required.</p>
+          </div>
           <label class="lease-field" for="owner-lease-deposit">Security Deposit (PHP)
-            <span class="lease-money-input"><span>₱</span><input id="owner-lease-deposit" v-model="leaseDeposit" type="number" min="0" step="0.01" inputmode="decimal" required :disabled="savingLease" /></span>
+            <span class="lease-money-input"><span>₱</span><input id="owner-lease-deposit" v-model="leaseDeposit" type="number" min="0" max="100000000" step="0.01" inputmode="decimal" aria-describedby="lease-deposit-explainer lease-deposit-hint" required :disabled="savingLease" /></span>
+            <small id="lease-deposit-hint" class="deposit-amount-hint">Enter the agreed amount (for example, ₱1,500.00). This is recorded once, not added to every monthly bill.</small>
           </label>
-          <p class="lease-helper"><IonIcon :icon="timeOutline" /> The lease will remain pending until the tenant reviews and confirms it.</p>
+          <p class="lease-helper"><IonIcon :icon="timeOutline" /> The agreement will remain pending until the tenant reviews and confirms the rental terms.</p>
           <p v-if="leaseDialogError" class="lease-error" role="alert">{{ leaseDialogError }}</p>
           <div class="lease-modal-actions"><button type="button" class="button secondary" :disabled="savingLease" @click="closeLeasePreparation">Cancel</button><button type="submit" class="button primary" :disabled="savingLease">{{ savingLease ? 'Preparing agreement...' : 'Prepare Lease' }}</button></div>
         </form>
@@ -2457,7 +2687,7 @@ async function logout() {
           <p v-if="billingError" class="billing-error" role="alert">{{ billingError }}</p>
         </div>
       </IonContent>
-      <div class="billing-dialog-footer"><button type="button" class="button secondary" :disabled="financeSaving" @click="billingStep === 1 ? closeBillingModal() : (billingStep = 1, billingError = '')">{{ billingStep === 1 ? 'Cancel' : 'Back' }}</button><button v-if="billingStep === 1" type="button" class="button primary" @click="advanceBilling">Continue to Charges →</button><button v-else type="submit" form="billing-new-form" class="button primary" :disabled="financeSaving">{{ financeSaving ? 'Creating Bill...' : 'Create Monthly Bill' }}</button></div>
+      <div class="billing-dialog-footer"><button type="button" class="button secondary" :disabled="financeSaving" @click="billingStep === 1 ? closeBillingModal() : (billingStep = 1, billingError = '')">{{ billingStep === 1 ? 'Cancel' : 'Back' }}</button><button v-if="billingStep === 1" type="button" class="button primary" @click="advanceBilling">Continue to Charges →</button><button v-else type="button" class="button primary" :disabled="financeSaving" @click="submitMonthlyBill">{{ financeSaving ? 'Creating Bill...' : 'Create Monthly Bill' }}</button></div>
     </IonModal>
     <IonModal
       :is-open="dialogOpen"
@@ -2622,6 +2852,7 @@ async function logout() {
               <input
                 v-model="form.email"
                 type="email"
+                readonly
                 required
               />
             </label>
@@ -2875,19 +3106,25 @@ async function logout() {
             </dl>
             <p class="lease-completion-note">
               Completing a lease ends its active status.
-              Outstanding bills remain in Bills &amp; Balances.
-              Lease and payment history are retained.
+              Only leases past their end date can be completed.
+              Outstanding bills remain in Bills &amp; Balances, and payment history is retained.
+              After completion, the unit enters maintenance for turnover inspection.
+              You can release it from Properties &amp; Units after inspection.
             </p>
             <div
               v-if="selectedLease.status === 'ACTIVE'"
               class="dialog-actions"
             >
+              <p v-if="selectedLease.end >= dateOffset(0)" class="lease-completion-note" role="status">
+                This lease ends on {{ readableDate(selectedLease.end) }}. Completion becomes available after the end date.
+              </p>
               <button
                 type="button"
                 class="button primary"
+                :disabled="savingLease || selectedLease.end >= dateOffset(0)"
                 @click="completeLease(selectedLease)"
               >
-                Complete Lease
+                {{ savingLease ? 'Completing...' : 'Complete Lease' }}
               </button>
             </div>
           </template>
@@ -2940,6 +3177,11 @@ async function logout() {
 </template>
 
 <style scoped>
+.deposit-highlights{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin:18px 0}
+.deposit-highlights article{background:#f0f6ff;border:1px solid #dce8fa;border-radius:12px;padding:15px;display:flex;flex-direction:column;gap:6px}
+.deposit-highlights span{color:#4c668b;font-size:12px;font-weight:650}.deposit-highlights strong{font-size:22px;color:#19447e}
+.deposit-actions{display:flex;gap:6px;flex-wrap:wrap}.deposit-reason{display:block;font-size:12px;color:#9a3b3b;margin-top:5px;max-width:240px}
+
 .portal,
 .dialog-content {
   color-scheme: light;
@@ -4642,4 +4884,13 @@ tbody tr:hover {background:#eef5ff}
 :global(ion-alert.rentease-messagebox .alert-button) {min-width:90px;min-height:40px;border-radius:10px;color:#185bb8;background:#eff5ff;font-weight:800;margin:0}
 :global(ion-alert.rentease-messagebox .alert-button:last-child) {background:linear-gradient(115deg,#1c5ed1,#178bd1);color:#fff}
 :global(ion-alert.rentease-messagebox .alert-button-inner) {justify-content:center}
+
+/* Security deposit education and clear financial inputs */
+.lease-deposit-explainer{padding:15px 17px;border:1px solid #c9dffc;border-radius:14px;background:linear-gradient(145deg,#f1f7ff,#f9fcff);color:#3c5679}
+.deposit-explainer-heading{display:flex;align-items:center;gap:9px;font-size:13px;color:#174d96;margin-bottom:7px}
+.deposit-explainer-heading ion-icon{font-size:20px;flex-shrink:0}
+.lease-deposit-explainer p{margin:8px 0 0;font-size:12px;line-height:1.7}
+.lease-deposit-explainer p strong{color:#1e477c}
+.deposit-amount-hint{font-size:11px;line-height:1.6;font-weight:500;color:#647e9e}
+@media(max-width:520px){.lease-deposit-explainer{padding:13px}}
 </style>

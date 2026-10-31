@@ -9,6 +9,9 @@ const billingRoutes = require('./routes/billing');
 const maintenanceRoutes = require('./routes/maintenance');
 const adminOverviewRoutes = require('./routes/adminOverview');
 const { auditCapture, auditRouter } = require('./routes/audit');
+const depositRoutes = require('./routes/deposits');
+const depositSettlementRoutes =
+  require('./routes/depositSettlements');
 dotenv.config();
 
 const pool = require('./db');
@@ -26,7 +29,7 @@ app.use(cors({
     credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '3mb' })); // Profile images: max 2 MB binary (~2.8 MB base64)
 app.use(express.urlencoded({ extended: true }));
 
 // Session configuration
@@ -85,6 +88,8 @@ app.use('/api', propertyRoutes);
 app.use('/api', applicationRoutes);
 app.use('/api', leaseRoutes);
 app.use('/api', billingRoutes);
+app.use('/api', depositRoutes);
+app.use('/api', depositSettlementRoutes);
 app.use('/api', maintenanceRoutes);
 app.use('/api', adminOverviewRoutes);
 app.use('/api', auditRouter);

@@ -15,7 +15,8 @@ async function auth(req,res,next) {
 const owner=(req,res,next)=>req.currentUser.role==='owner'?next():res.status(403).json({success:false,message:'Owner access required.'});
 const tenant=(req,res,next)=>req.currentUser.role==='tenant'?next():res.status(403).json({success:false,message:'Tenant access required.'});
 router.use(auth);
-const leaseSelect=`SELECT l.lease_id,l.application_id,l.tenant_id,l.unit_id,l.start_date,l.end_date,
+const leaseSelect=`SELECT l.lease_id,l.application_id,l.tenant_id,l.unit_id,TO_CHAR(l.start_date, 'YYYY-MM-DD') AS start_date,
+TO_CHAR(l.end_date, 'YYYY-MM-DD') AS end_date,
  l.monthly_rent,l.security_deposit,l.status, t.full_name AS tenant_name,
  u.unit_number,p.property_name,p.owner_id
  FROM leases l JOIN app_users t ON t.user_id=l.tenant_id
@@ -75,19 +76,90 @@ router.patch('/leases/:id/confirm',tenant,async(req,res,next)=>{
   await client.query('COMMIT');res.json({success:true,lease:lease.rows[0]});
  }catch(e){await client.query('ROLLBACK');next(e)}finally{client.release()}
 });
-router.patch('/owner/leases/:id/complete',owner,async(req,res,next)=>{
- if(!validId(req.params.id))return res.status(400).json({success:false,message:'Invalid lease ID.'});
- const client=await pool.connect();
- try{
-  await client.query('BEGIN');
-  const r=await client.query(`${leaseSelect} WHERE l.lease_id=$1`,[req.params.id]);
-  if(!r.rows.length||Number(r.rows[0].owner_id)!==req.currentUser.id){await client.query('ROLLBACK');return res.status(404).json({success:false,message:'Lease not found.'})}
-  await client.query('SELECT unit_id FROM units WHERE unit_id=$1 FOR UPDATE',[r.rows[0].unit_id]);
-  const changed=await client.query("UPDATE leases SET status='completed' WHERE lease_id=$1 AND LOWER(status)='active' RETURNING lease_id",[req.params.id]);
-  if(!changed.rows.length){await client.query('ROLLBACK');return res.status(409).json({success:false,message:'Only active leases can be completed.'})}
-  await client.query("UPDATE units SET status='available' WHERE unit_id=$1 AND LOWER(status)='occupied'",[r.rows[0].unit_id]);
-  const result=await client.query(`${leaseSelect} WHERE l.lease_id=$1`,[req.params.id]);
-  await client.query('COMMIT');res.json({success:true,lease:result.rows[0]});
- }catch(e){await client.query('ROLLBACK');next(e)}finally{client.release()}
+// Complete an active lease only after its scheduled end date.
+// Unit release is still part of this legacy endpoint; a separate turnover
+// workflow requires coordinated changes to the units schema and owner UI.
+router.patch('/owner/leases/:id/complete', owner, async (req, res, next) => {
+  if (!validId(req.params.id)) {
+    return res.status(400).json({ success: false, message: 'Invalid lease ID.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // Look up the unit first so every lease workflow locks resources
+    // in the same order: unit, then lease.
+    const lookup = await client.query(
+      `${leaseSelect} WHERE l.lease_id=$1`,
+      [req.params.id]
+    );
+    const requested = lookup.rows[0];
+    if (!requested || Number(requested.owner_id) !== req.currentUser.id) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Lease not found.' });
+    }
+
+    const lockedUnit = await client.query(
+      'SELECT unit_id, status FROM units WHERE unit_id=$1 FOR UPDATE',
+      [requested.unit_id]
+    );
+    const lockedLease = await client.query(
+      'SELECT lease_id, unit_id, status, end_date FROM leases WHERE lease_id=$1 FOR UPDATE',
+      [req.params.id]
+    );
+    const current = lockedLease.rows[0];
+    if (!current || Number(current.unit_id) !== Number(requested.unit_id)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'Rental details changed. Please refresh and try again.' });
+    }
+    if (String(current.status).toLowerCase() !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'Only active leases can be completed.' });
+    }
+    if (String(lockedUnit.rows[0]?.status).toLowerCase() !== 'occupied') {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ success: false, message: 'Unit status does not match the active lease. Please contact the administrator.' });
+    }
+
+    // An inclusive end date is still part of the lease on that day.
+     const dateCheck = await client.query(
+      `SELECT
+         $1::date <
+         (NOW() AT TIME ZONE 'Asia/Manila')::date
+         AS past_end`,
+      [current.end_date]
+    );
+    if (!dateCheck.rows[0].past_end) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        success: false,
+        message: 'This lease has not passed its end date. Early termination requires a separate authorized process.'
+      });
+    }
+
+    await client.query(
+      "UPDATE leases SET status='completed' WHERE lease_id=$1",
+      [req.params.id]
+    );
+    const released = await client.query(
+      "UPDATE units SET status='maintenance' WHERE unit_id=$1 AND LOWER(status)='occupied' RETURNING unit_id",
+      [current.unit_id]
+    );
+    if (!released.rows.length) {
+      throw new Error('Unit turnover status update failed; lease completion was rolled back.');
+    }
+    const result = await client.query(
+      `${leaseSelect} WHERE l.lease_id=$1`,
+      [req.params.id]
+    );
+    await client.query('COMMIT');
+    return res.json({ success: true, lease: result.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    return next(error);
+  } finally {
+    client.release();
+  }
 });
 module.exports=router;

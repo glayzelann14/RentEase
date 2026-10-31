@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { getMyProfile, saveMyProfile } from '@/services/profile';
 import { reactive, ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { restoreSession } from '@/services/auth';
@@ -345,6 +346,7 @@ onMounted(async () => {
     }
     state.profile.name = user.name || '';
     state.profile.email = user.email || '';
+    try { const saved = await getMyProfile(); state.profile.name = saved.name; state.profile.mobile = saved.mobile; state.profile.avatar = saved.avatar_url; } catch(error) { console.warn('Profile loading failed:',error); }
     await Promise.all([fetchUsers(), fetchPlatformOverview(), fetchAuditEvents()]);
   } catch (error) {
     overviewError.value = error instanceof Error ? error.message : 'Could not verify administrator session.';
@@ -630,6 +632,10 @@ function handleAvatarUpload(event: Event) {
   const file = (event.target as HTMLInputElement).files?.[0];
   if (!file) return;
 
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type) || file.size > 2 * 1024 * 1024) {
+    void showCustomAlert('Invalid picture', 'Choose a JPG, PNG, or WebP file smaller than 2 MB.');
+    return;
+  }
   const reader = new FileReader();
 
   reader.onload = () => {
@@ -640,20 +646,17 @@ function handleAvatarUpload(event: Event) {
 }
 
 async function saveProfile() {
-  state.profile.name = profileForm.name;
-  state.profile.email = profileForm.email;
-  state.profile.mobile = profileForm.mobile;
-  state.profile.avatar = profileForm.avatar;
-
-  localStorage.setItem('userName', profileForm.name);
-  localStorage.setItem('userEmail', profileForm.email);
-
-  closeDialog();
-
-  await showCustomAlert(
-    'RentEase Admin',
-    'Admin profile preview changed in this browser only. Database profile updates are not configured.'
-  );
+  try {
+    const saved = await saveMyProfile(profileForm.name.trim(), profileForm.mobile.trim(), profileForm.avatar);
+    state.profile.name = saved.name;
+    state.profile.email = saved.email;
+    state.profile.mobile = saved.mobile;
+    state.profile.avatar = saved.avatar_url || profileForm.avatar;
+    closeDialog();
+    await showCustomAlert('Profile updated', 'Your profile has been updated successfully.');
+  } catch(error: any) {
+    await showCustomAlert('Profile update failed', error?.response?.data?.message || error?.message || 'Unable to save profile.');
+  }
 }
 
 async function triggerSystemMaintenance() {
@@ -1319,13 +1322,13 @@ async function logout() {
 
           <form @submit.prevent="saveProfile">
             <label>Profile Picture</label>
-            <input type="file" accept="image/*" @change="handleAvatarUpload" />
+            <input type="file" accept="image/jpeg,image/png,image/webp" @change="handleAvatarUpload" />
 
             <label>Full Name</label>
             <input v-model="profileForm.name" required placeholder="Full name" />
 
             <label>Email Address</label>
-            <input v-model="profileForm.email" required type="email" placeholder="Email address" />
+            <input v-model="profileForm.email" required readonly type="email" placeholder="Email address" />
 
             <label>Mobile Number</label>
             <input v-model="profileForm.mobile" placeholder="Mobile number" />
